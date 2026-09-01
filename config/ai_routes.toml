@@ -7,10 +7,13 @@ credential_host = "api.deepseek.com"
 api_prefix = ""
 
 [tasks.chat]
-primary = "deepseek/deepseek-v4-flash"
+primary = "deepseek/deepseek-v4-flash-vision-exp"
 fallbacks = ["gpt_gateway/gpt-5.6-terra"]
 temperature = 0.75
 max_tokens = 1800
+thinking_supported = true
+thinking_enabled = false
+file_types = ["image/png", "image/jpeg", "image/webp"]
 
 [tasks.tool_planner]
 primary = "deepseek/deepseek-v4-flash"

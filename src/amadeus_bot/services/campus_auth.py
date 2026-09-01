@@ -22,7 +22,9 @@ class CampusSessionExpired(RuntimeError):
 
 class CampusAuthenticator:
     def __init__(self) -> None:
-        self.password_file = _resolve_project_path(os.getenv("AMADEUS_PASSWORD_FILE", "../password.txt"))
+        self.password_file = _resolve_project_path(
+            os.getenv("AMADEUS_PASSWORD_FILE", "secrets/campus-password.txt")
+        )
 
     @property
     def available(self) -> bool:
@@ -188,7 +190,7 @@ class CampusAuthenticator:
             raise RuntimeError(f"自动登录凭据文件不存在：{self.password_file}")
         lines = self.password_file.read_text(encoding="utf-8-sig").splitlines()
         if len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
-            raise RuntimeError("password.txt 必须第一行为账号、第二行为密码")
+            raise RuntimeError("校园自动登录凭据必须第一行为账号、第二行为密码")
         return lines[0].strip(), lines[1].strip()
 
     @staticmethod

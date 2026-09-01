@@ -1,7 +1,7 @@
 [project]
 name = "amadeus-qq-bot"
 version = "0.1.0"
-description = "A structured Amadeus QQ bot powered by NoneBot 2 and NapCat"
+description = "YouXueBan, a BUPT study assistant with Web and NoneBot interfaces"
 readme = "README.md"
 requires-python = ">=3.12,<4.0"
 dependencies = [

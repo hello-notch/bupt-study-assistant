@@ -83,7 +83,7 @@ async def handle_health(bot: Bot, event, arguments: Message = CommandArg()) -> N
         f"AI provider：{len(container.ai.providers)}\n"
         f"渲染缓存：{cache_count} 张\n诊断耗时：{elapsed_ms} ms\nAI 路由：\n{routes}"
     )
-    await finish_text_or_image(health_command, text, title="Amadeus 健康状态")
+    await finish_text_or_image(health_command, text, title="邮学伴健康状态")
 
 
 @cost_command.handle()

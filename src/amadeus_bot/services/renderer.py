@@ -23,7 +23,7 @@ class RenderService:
         material = "\x1f".join((self.STYLE_VERSION, kind, variant, content))
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
-    async def render_text(self, content: str, *, title: str = "Amadeus", variant: str = "default") -> Path:
+    async def render_text(self, content: str, *, title: str = "邮学伴", variant: str = "default") -> Path:
         return await self._render(
             content,
             title=title,
@@ -33,7 +33,7 @@ class RenderService:
         )
 
     async def render_markdown(
-        self, content: str, *, title: str = "Amadeus", variant: str = "markdown"
+        self, content: str, *, title: str = "邮学伴", variant: str = "markdown"
     ) -> Path:
         from markdown_it import MarkdownIt
 

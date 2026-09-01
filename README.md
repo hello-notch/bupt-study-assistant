@@ -1,71 +1,60 @@
 # 邮学伴
 
-邮学伴是一套面向北邮学生的学习与校园信息助手，也是 `new_bot` 的独立代码副本。项目保留原有 NoneBot 业务层，并新增不依赖 QQ 界面的 Web 前端。
+邮学伴是面向北邮学生的学习与校园信息助手，也是原机器人项目的独立备份。课程项目以 Vue 3 + TypeScript 网页作为完整软件界面；保留的 NoneBot 业务代码可在课程结束后继续用于 QQ 机器人模式。
 
-当前前端已经完成可交互 MVP：
+## 当前功能
 
-- “今天”聚合下一节课、当日课程、近期 DDL 与校园动态；
-- 任务列表、搜索、状态切换、新增、完成、恢复和删除；
-- 桌面周课表、移动端课程时间线、课程编辑，以及可实际解析 XLS/XLSX/CSV 的三步导入向导；
-- 信息门户通知与第二课堂活动的列表、搜索、详情和订阅状态；
-- 不要求输入命令的 Amadeus 助手：服务端 AI 可用时进行开放式对话，不可用时明确切换本地学习数据助手；
-- 通知中心、浅色/深色模式、默认提醒、静默时段和隐私开关；
-- 桌面侧边栏与移动端底部导航，最小支持 320px 宽度。
+- 首次打开使用独立动画欢迎页询问称呼，不预置任务、课程、通知或校园演示条目；
+- “今天”显示实时日期与时间、当日课程、近期任务、真实校园动态和可轮换学习建议；
+- 任务支持创建、搜索、完成、恢复、删除、提前提醒，以及“静默时段仍提醒”；
+- 课表支持 XLS/XLSX/CSV、本班教务查询、导入预览、替换/合并确认、周次切换和每天日期；
+- 校园页只读查询真实信息门户和第二课堂，信息门户通知可生成 AI 总结并以每次 10 条、最多 50 条分页展示；第二课堂分别呈现成功空结果、鉴权失败、网络失败与缓存状态；
+- 查电费只需输入楼宇与宿舍号（如 `A410`、`S2-410`、`学8 321` 或 `学八321`），楼宇与宿舍号之间可使用横杠、空格或不加分隔符；“学n”中的 n 支持数字和汉字一至十。查询会自动补全校区、园区和楼层，西土城结果为剩余电量与剩余赠送电量之和，同时显示官方电费更新时间与本次查询时间；
+- 学习助手使用 `DeepSeek-V4-Flash-Vision-Exp`，支持学习问答、课程/DDL/校园通知/电费工具调用、Markdown 与 LaTeX、按会话保存记录、非空会话二次确认删除、输入框自动增高、快速/思考模式切换，以及模型允许的 PNG/JPG/WebP 图片输入；首次回答后由 `deepseek-v4-flash` 生成 10 字内会话标题，API Key 只由服务端读取；
+- 设置支持昵称与头像修改、个人信息二次确认重置、浅色/深色、学期起始日、任务提醒的分钟/小时/天单位和静默时段；关闭个性化记忆后助手不再接收历史消息与称呼，关闭学习数据分析后助手不再隐式接收本地课程、任务、校园和通知数据，首页也改用通用建议。
 
-任务、课程、校园已读状态和设置当前使用 `localStorage` 持久化。Vite 本地服务提供两个仅服务端运行的薄接口：AI 对话会复用项目的 AI 路由与凭据文件，班级导入会使用已配置的教务系统会话。正式部署阶段仍应由 Web API / OneBot Bridge 接管持久化、鉴权和业务校验；界面不会向用户暴露 `/ddl`、`/course` 等兼容命令。
+任务、课程、称呼、宿舍号、已读状态、助手对话和设置使用浏览器 `localStorage` 保存。API Key、教务 Cookie、门户 Cookie、第二课堂 token 和电费系统 Cookie 只由 Vite 服务端代理读取，不进入浏览器存储。助手图片单张限制为 1 MB、每条消息最多 2 张，以避免浏览器本地存储被快速占满。
 
 ## 目录
 
 ```text
 bupt_study_assistant/
-├─ web/                         # Vue 3 + TypeScript 前端
-│  ├─ src/App.vue               # 页面、交互和本地状态
-│  ├─ src/course-import.ts       # XLS/XLSX/CSV 课表解析
-│  ├─ src/styles.css            # 响应式设计系统
-│  ├─ src/demo-data.ts          # 可替换的演示数据
-│  ├─ src/types.ts              # 前后端共享 DTO 草案
-│  └─ dev-api.ts                # 开发模式 AI 与教务代理（密钥不进入浏览器）
-├─ src/amadeus_bot/             # 从 new_bot 保留的 NoneBot 业务代码
-├─ tests/                       # 原有后端测试
-├─ docs/web-frontend-design.md  # 产品、架构和接口方案
-├─ docs/legacy-bot-readme.md    # 原机器人说明备份
-└─ run-web.ps1                  # 本机前端启动入口
+├─ web/
+│  ├─ src/App.vue                 # 页面与交互
+│  ├─ src/course-import.ts        # 真实课表文件解析
+│  ├─ src/styles.css              # 响应式设计
+│  ├─ src/types.ts                # 前端数据结构
+│  └─ dev-api.ts                  # AI、教务与校园服务端代理
+├─ scripts/read_web_campus_cache.py # 真实校园缓存读取
+├─ src/                           # 保留的 NoneBot 业务层
+├─ config/ai_routes.toml          # AI 路由
+├─ docs/web-frontend-design.md    # 产品与架构方案
+├─ .env.example                   # 无凭据配置模板
+├─ run-web.cmd
+└─ run-web.ps1
 ```
 
-没有复制原项目的 `.env`、`secrets/`、用户数据库、日志、缓存或 `.venv`。这些内容包含运行状态或敏感信息，不应成为课程项目副本的一部分。
+项目运行时不依赖 `D:\Bots\new_bot` 或 NapCat。当前工作区的 `.env`、`secrets/` 和 `data/` 已复制到本项目并由 Git 忽略；迁移到新电脑时需单独安全迁移这些本地文件。
 
-## 独立运行说明
+## 启动
 
-本目录不依赖 `D:\Bots` 下的 `new_bot`、NapCat 或其他兄弟目录。复制或克隆整个 `bupt_study_assistant` 目录后即可独立安装与运行：
-
-- 只使用网页、本地任务、文件课表导入和本地助手时，仅需要 Node.js 20+ 与 `pnpm install`；
-- 启用在线 AI 或按班级导入时，在项目内根据 `.env.example` 创建自己的 `.env` 和 `secrets/`，不要复制到仓库；
-- 运行保留的 NoneBot 后端时，需要 Python 3.12 和 `uv sync`，但网页基础功能不依赖 NoneBot 进程。
-
-## 运行前端
-
-依赖已经在当前工作区安装。Windows 下推荐双击 `run-web.cmd`，或者在终端运行：
+Windows 推荐在项目根目录运行：
 
 ```powershell
 .\run-web.cmd
 ```
 
-然后访问 <http://127.0.0.1:5173/>。
-
-也可以显式使用 PowerShell 7，并按需指定端口：
+默认打开 <http://127.0.0.1:5173/>。也可指定端口：
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\run-web.ps1 -Port 5173
+pwsh -NoLogo -NoProfile -File .\run-web.ps1 -Port 5174
 ```
 
-如果系统提示 `running scripts is disabled on this system`，说明 Windows PowerShell 5.1 的执行策略阻止了 `.ps1`，不是前端代码错误。直接使用 `run-web.cmd` 即可，不需要修改系统执行策略。
-
-在一台新电脑上首次安装：
+首次安装前端依赖：
 
 ```powershell
 cd .\web
 pnpm install
-pnpm run dev
 ```
 
 生产构建：
@@ -75,27 +64,31 @@ cd .\web
 pnpm run build
 ```
 
-构建结果位于 `web/dist/`。
+## 在线能力配置
 
-### AI 与班级课表接入
+复制 `.env.example` 为 `.env`，并把真实凭据放在项目内已忽略的 `secrets/`：
 
-开发服务会读取项目根目录 `.env`，但不会把凭据注入浏览器：
+- `YOUXUEBAN_API_KEY_FILE`、`YOUXUEBAN_AI_ROUTES_FILE`：在线 AI；
+- `YOUXUEBAN_JWGL_COOKIE_FILE`：按班级查询教务课表；
+- `YOUXUEBAN_CAMPUS_PASSWORD_FILE`：仅供信息门户、教务系统和第二课堂会话失效后自动续登录；
+- `YOUXUEBAN_PORTAL_COOKIE_FILE`：信息门户通知；
+- `YOUXUEBAN_ACTIVITY_TOKEN_FILE`、`YOUXUEBAN_ACTIVITY_LIST_ENDPOINT`：第二课堂只读活动；
+- `YOUXUEBAN_ELECTRICITY_COOKIE_FILE`、`YOUXUEBAN_ELECTRICITY_QUERY_URL`：官方电费余额与更新时间查询；
+- `YOUXUEBAN_SEMESTER_START`：第 1 周周一，用于周次与日期计算。
 
-- `AMADEUS_API_KEY_FILE`：现有 `apikey.txt` 路径；模型与供应商仍来自 `config/ai_routes.toml` 的 `tasks.chat`。
-- `AMADEUS_JWGL_COOKIE_FILE`：教务系统 Cookie 请求头文件路径，用于“按班级导入”。
+信息门户、教务系统和电费系统的 Cookie 会自然过期。首次运行 `python scripts/configure_campus_secrets.py` 并选择 6，将统一认证账号和密码保存到受保护的 `secrets/campus-password.txt`；此后信息门户、教务系统和第二课堂在确认鉴权失效时会自动续登录、原子更新 Cookie 或 token，并只重试原请求一次。多个并发请求会共用同一次续期，避免重复登录。信息门户和第二课堂遇到网站验证时可能短暂打开项目 Playwright Chromium；遇到验证码、密码错误或页面变化会停止并明确报错，不会无限重试。
 
-没有配置 AI 时，聊天页会明确显示“本地模式”，仍可查询当前课程、DDL、校园条目、生成学习安排和用自然语言创建任务。没有配置教务会话时，班级导入会显示具体错误，文件导入不受影响。
+校园页会明确区分在线、缓存和失效状态。也可运行 `python scripts/configure_campus_cookies_gui.py` 手工保存信息门户、教务系统和电费系统 Cookie，电费会话写入 `secrets/electricity-cookie.txt`。第二课堂在线接口返回 0 条时表示当前没有进行中的活动，不等同于连接失败。电费系统暂不参与统一的自动续期，失效时仍需手工更新其 Cookie。
 
-`demo-data.ts` 中的校园条目是注明为演示的内容，“查看原文”会打开相应官方来源网站；接入真实校园缓存后，前端直接使用后端保存的具体 `url`。
+会话失效时页面会明确提示更新相应凭据，不会显示演示结果。第二课堂只实现查询、查看和订阅，不提供报名、签到或退选操作。
 
-## 前端交互原则
+## 验证
 
-- 页面主要使用按钮、表单、筛选器、日历和自然语言，不要求学生学习机器人命令；
-- 写操作在提交前展示结构化结果，删除和覆盖操作要求确认；
-- 第二课堂保持只读，不提供报名、签到和退选；
-- 数据源错误、空结果和离线状态必须分别呈现；
-- 后端接入时由服务层执行权限、时间解析、冲突检查和审计，浏览器只负责交互与展示。
+```powershell
+cd .\web
+.\node_modules\.bin\vue-tsc.cmd --noEmit -p .\tsconfig.app.json
+.\node_modules\.bin\tsc.cmd --noEmit -p .\tsconfig.node.json
+.\node_modules\.bin\vite.cmd build
+```
 
-## 后端说明
-
-保留的 NoneBot 能力、校园凭据配置与机器人运行方式见 [原机器人说明](docs/legacy-bot-readme.md)。Web 版的架构、OneBot Bridge 最小兼容面、原生 API 草案和验收标准见 [前端设计方案](docs/web-frontend-design.md)。
+界面修改还应在桌面和约 390px 宽度下实际验证欢迎界面、表单、课表切换、覆盖确认、AI 错误态与校园空状态。

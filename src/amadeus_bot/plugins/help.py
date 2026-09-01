@@ -65,7 +65,7 @@ async def handle_help(matcher: Matcher, event, arguments: Message = CommandArg()
     await _finish_help_image(
         matcher,
         _format_overview(role, group_id),
-        title="Amadeus Bot 帮助",
+        title="邮学伴帮助",
         variant=f"overview:{role.value}",
     )
 
@@ -89,7 +89,7 @@ async def prewarm_help_images() -> None:
             jobs.append(
                 container.renderer.render_text(
                     _format_overview(role, group_id),
-                    title="Amadeus Bot 帮助",
+                    title="邮学伴帮助",
                     variant=f"overview:{role.value}",
                 )
             )
@@ -121,7 +121,7 @@ async def _finish_help_image(matcher: Matcher, text: str, *, title: str, variant
 def _format_overview(role: PermissionLevel, group_id: str | None) -> str:
     visible = [spec for spec in command_registry.all() if _visible(spec, role, group_id)]
     by_name = {spec.name: spec for spec in visible}
-    lines = ["Amadeus Bot · 可用命令", ""]
+    lines = ["邮学伴 · 可用命令", ""]
     included: set[str] = set()
     for title, names in HELP_GROUPS:
         specs = [by_name[name] for name in names if name in by_name]

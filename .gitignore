@@ -22,7 +22,6 @@ web/dist/
 web/.vite/
 *.tsbuildinfo
 
-# Local coding-agent instructions and workspace metadata
-AGENTS.md
+# Local coding-agent workspace metadata
 .agents/
 .codex/

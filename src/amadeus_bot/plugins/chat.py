@@ -24,7 +24,7 @@ from amadeus_bot.services.tools import ToolExecutionContext
 command_registry.register(
     CommandSpec(
         name="chat",
-        description="与 Amadeus 进行角色化对话",
+        description="与邮学伴进行学习对话",
         usage="/chat <message>；也可 @ 或回复机器人",
         permission=PermissionLevel.EVERYONE,
         feature="chat",
@@ -83,7 +83,7 @@ async def handle_history(event, arguments: Message = CommandArg()) -> None:
     ]
     if rows:
         for index, row in enumerate(rows, start=1):
-            role = "用户" if row["role"] == "user" else "Amadeus"
+            role = "用户" if row["role"] == "user" else "邮学伴"
             lines.append(f"{index}. {role}\n{row['content']}")
     else:
         lines.append("（当前作用域还没有 AI 对话记录）")
@@ -134,7 +134,7 @@ async def handle_proactive(bot: Bot, event) -> None:
                     {
                         "role": "user",
                         "content": (
-                            "判断 Amadeus 是否应主动接话。只回复 JSON："
+                            "判断邮学伴是否应主动接话。只回复 JSON："
                             '{"respond":true/false,"confidence":0-1,"reason":"..."}。消息：' + text
                         ),
                     }
@@ -192,7 +192,7 @@ async def _respond(matcher, bot: Bot, event, text: str) -> None:
             replied_message_id=reply_message_id(event),
         )
     except Exception:
-        await matcher.finish("Amadeus 暂时无法连接到 AI 服务，请稍后再试。")
+        await matcher.finish("邮学伴暂时无法连接到 AI 服务，请稍后再试。")
     reply = response.content.strip()
     if not reply:
         await matcher.finish("AI 返回了空内容，请稍后重试。")
@@ -210,7 +210,7 @@ async def _respond(matcher, bot: Bot, event, text: str) -> None:
             "output_tokens": response.output_tokens,
         },
     )
-    await finish_text_or_image(matcher, reply, title="Amadeus")
+    await finish_text_or_image(matcher, reply, title="邮学伴")
 
 
 async def _resolve_tool_calls(
@@ -336,7 +336,7 @@ async def _enrich_input(container, bot: Bot, event, text: str, group_id: str | N
 def _proactive_score(text: str, group_id: str, now: float) -> int:
     score = 0
     lowered = text.lower()
-    if any(name in lowered for name in ("amadeus", "阿玛迪斯", "助手", "机器人")):
+    if any(name in lowered for name in ("邮学伴", "助手", "机器人")):
         score += 4
     if text.endswith(("?", "？")):
         score += 2

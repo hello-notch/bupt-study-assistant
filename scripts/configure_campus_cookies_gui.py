@@ -19,10 +19,11 @@ from configure_campus_secrets import (
 class CookieConfigurator:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Amadeus 校园 Cookie 配置")
+        self.root.title("邮学伴校园 Cookie 配置")
         self.root.resizable(False, False)
         self.portal = tk.StringVar()
         self.jwgl = tk.StringVar()
+        self.electricity = tk.StringVar()
 
         frame = tk.Frame(root, padx=18, pady=16)
         frame.pack(fill="both", expand=True)
@@ -35,9 +36,10 @@ class CookieConfigurator:
 
         self._add_secret_row(frame, 1, "信息门户 Cookie", self.portal)
         self._add_secret_row(frame, 2, "教务系统 Cookie", self.jwgl)
+        self._add_secret_row(frame, 3, "电费系统 Cookie", self.electricity)
 
         tk.Button(frame, text="保存已填写的 Cookie", command=self.save, width=20).grid(
-            row=3, column=0, columnspan=3, pady=(16, 0)
+            row=4, column=0, columnspan=3, pady=(16, 0)
         )
 
     def _add_secret_row(self, frame: tk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
@@ -61,13 +63,15 @@ class CookieConfigurator:
     def save(self) -> None:
         portal_raw = self.portal.get().strip()
         jwgl_raw = self.jwgl.get().strip()
-        if not portal_raw and not jwgl_raw:
+        electricity_raw = self.electricity.get().strip()
+        if not portal_raw and not jwgl_raw and not electricity_raw:
             messagebox.showerror("无法保存", "请至少填写一项完整的 Cookie 请求头。")
             return
 
         try:
             portal_cookie = normalize_cookie_header(portal_raw) if portal_raw else ""
             jwgl_cookie = normalize_cookie_header(jwgl_raw) if jwgl_raw else ""
+            electricity_cookie = normalize_cookie_header(electricity_raw) if electricity_raw else ""
         except SystemExit as exc:
             messagebox.showerror("无法保存", str(exc))
             return
@@ -80,9 +84,13 @@ class CookieConfigurator:
         if jwgl_cookie:
             (SECRETS_DIR / "jwgl-cookie.txt").write_text(jwgl_cookie, encoding="utf-8")
             saved.append("教务系统")
+        if electricity_cookie:
+            (SECRETS_DIR / "electricity-cookie.txt").write_text(electricity_cookie, encoding="utf-8")
+            saved.append("电费系统")
         protected = protect_secrets_directory()
         self.portal.set("")
         self.jwgl.set("")
+        self.electricity.set("")
         messagebox.showinfo(
             "保存成功",
             "、".join(saved) + " Cookie 已保存。\n目录 ACL：" + ("已限制" if protected else "未自动修改"),

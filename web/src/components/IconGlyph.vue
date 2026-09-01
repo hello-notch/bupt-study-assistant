@@ -27,6 +27,9 @@ defineProps<{ name: string; size?: number }>();
     <template v-else-if="name === 'campus'">
       <path d="m3 10 9-6 9 6M5 10v8M9 10v8M15 10v8M19 10v8M3 20h18" />
     </template>
+    <template v-else-if="name === 'electricity'">
+      <path d="M13 2 5.5 13h6L11 22l7.5-12h-6L13 2Z" />
+    </template>
     <template v-else-if="name === 'assistant'">
       <path d="m12 3-1.1 3.2a3 3 0 0 1-1.9 1.9L6 9.2l3 1.1a3 3 0 0 1 1.9 1.9L12 15l1.1-2.8a3 3 0 0 1 1.9-1.9l3-1.1-3-1.1a3 3 0 0 1-1.9-1.9L12 3Z" /><path d="m5 15-.6 1.7a2 2 0 0 1-1.2 1.2L2 18.3l1.2.4a2 2 0 0 1 1.2 1.2L5 21.5l.6-1.6a2 2 0 0 1 1.2-1.2l1.2-.4-1.2-.4a2 2 0 0 1-1.2-1.2L5 15Z" />
     </template>
@@ -50,6 +53,7 @@ defineProps<{ name: string; size?: number }>();
     <template v-else-if="name === 'check'"><path d="m5 12 4 4L19 6" /></template>
     <template v-else-if="name === 'book'"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V4H6.5A2.5 2.5 0 0 0 4 6.5v13Z" /><path d="M8 7h8M8 11h6" /></template>
     <template v-else-if="name === 'external'"><path d="M15 3h6v6M10 14 21 3M18 13v7H4V6h7" /></template>
+    <template v-else-if="name === 'refresh'"><path d="M20 7v5h-5M4 17v-5h5" /><path d="M18.5 10a7 7 0 0 0-12-3L4 10M5.5 14a7 7 0 0 0 12 3l2.5-3" /></template>
     <template v-else-if="name === 'moon'"><path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z" /></template>
     <template v-else><circle cx="12" cy="12" r="9" /><path d="M12 8h.01M11 12h1v4h1" /></template>
   </svg>

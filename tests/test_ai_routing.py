@@ -11,7 +11,7 @@ def test_route_catalog_assigns_cheap_and_quality_models() -> None:
 
     assert catalog.routes[AITask.PROACTIVE_GATE].primary.model == "deepseek-v4-flash"
     assert catalog.routes[AITask.VISION].primary.model == "deepseek-v4-flash-vision-exp"
-    assert catalog.routes[AITask.CHAT].primary.model == "deepseek-v4-flash"
+    assert catalog.routes[AITask.CHAT].primary.model == "deepseek-v4-flash-vision-exp"
     assert catalog.routes[AITask.CHAT].fallbacks[0].model == "gpt-5.6-terra"
 
 

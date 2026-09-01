@@ -21,27 +21,41 @@ def main() -> None:
     print("  1. 信息门户 Cookie 请求头")
     print("  2. 教务系统 Cookie 请求头")
     print("  3. 第二课堂 Authorization Bearer token")
-    print("  4. 依次配置以上三项")
-    choice = input("请输入 1/2/3/4：").strip()
-    if choice not in {"1", "2", "3", "4"}:
+    print("  4. 电费系统 Cookie 请求头")
+    print("  5. 依次配置以上四项")
+    print("  6. 校园自动登录账号和密码（推荐，可自动续期前三项）")
+    choice = input("请输入 1/2/3/4/5/6：").strip()
+    if choice not in {"1", "2", "3", "4", "5", "6"}:
         raise SystemExit("无效选择")
 
     SECRETS_DIR.mkdir(parents=True, exist_ok=True)
     acl_protected = protect_secrets_directory()
-    choices = ("1", "2", "3") if choice == "4" else (choice,)
+    choices = ("1", "2", "3", "4") if choice == "5" else (choice,)
     for current_choice in choices:
         configure_one(current_choice, acl_protected)
 
 
 def configure_one(choice: str, acl_protected: bool) -> None:
-    if choice in {"1", "2"}:
-        source = "信息门户" if choice == "1" else "教务系统"
+    if choice == "6":
+        account = getpass.getpass("输入统一身份认证账号（输入不会显示）：").strip()
+        password = getpass.getpass("输入统一身份认证密码（输入不会显示）：").strip()
+        if not account or not password or "\n" in account or "\n" in password:
+            raise SystemExit("账号和密码必须是非空单行文本")
+        path = SECRETS_DIR / "campus-password.txt"
+        path.write_text(f"{account}\n{password}\n", encoding="utf-8")
+        variable = "YOUXUEBAN_CAMPUS_PASSWORD_FILE"
+    elif choice in {"1", "2", "4"}:
+        source = {"1": "信息门户", "2": "教务系统", "4": "电费系统"}[choice]
         raw = getpass.getpass(f"粘贴{source}的完整 Cookie 请求头（输入不会显示）：").strip()
         cookie_header = normalize_cookie_header(raw)
-        filename = "portal-cookie.txt" if choice == "1" else "jwgl-cookie.txt"
+        filename = {"1": "portal-cookie.txt", "2": "jwgl-cookie.txt", "4": "electricity-cookie.txt"}[choice]
         path = SECRETS_DIR / filename
         path.write_text(cookie_header, encoding="utf-8")
-        variable = "AMADEUS_PORTAL_COOKIE_FILE" if choice == "1" else "AMADEUS_JWGL_COOKIE_FILE"
+        variable = {
+            "1": "YOUXUEBAN_PORTAL_COOKIE_FILE",
+            "2": "YOUXUEBAN_JWGL_COOKIE_FILE",
+            "4": "YOUXUEBAN_ELECTRICITY_COOKIE_FILE",
+        }[choice]
     else:
         token = getpass.getpass("粘贴 Authorization 值或 Bearer 后的 token（输入不会显示）：").strip()
         if token.lower().startswith("bearer "):
@@ -50,7 +64,7 @@ def configure_one(choice: str, acl_protected: bool) -> None:
             raise SystemExit("token 不能为空")
         path = SECRETS_DIR / "activity-token.txt"
         path.write_text(token, encoding="utf-8")
-        variable = "AMADEUS_ACTIVITY_TOKEN_FILE"
+        variable = "YOUXUEBAN_ACTIVITY_TOKEN_FILE"
 
     print(f"已保存到：{path}")
     print("目录 ACL：" + ("已限制为当前 Windows 用户和 SYSTEM" if acl_protected else "未自动修改"))

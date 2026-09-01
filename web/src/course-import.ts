@@ -2,14 +2,16 @@ import * as XLSX from "xlsx";
 import type { Course } from "./types";
 
 export type ImportedCourse = Omit<Course, "id" | "color" | "reminderMinutes">;
+type CourseColumn = keyof ImportedCourse | "sections";
 
-const aliases: Record<keyof ImportedCourse, string[]> = {
+const aliases: Record<CourseColumn, string[]> = {
   name: ["课程名", "课程名称", "课程", "name"],
   teacher: ["教师", "老师", "任课教师", "teacher"],
   location: ["教室", "地点", "上课地点", "location"],
   weekday: ["星期", "周几", "星期几", "weekday"],
   startSection: ["开始节次", "起始节次", "开始节", "start_section", "startsection"],
   endSection: ["结束节次", "终止节次", "结束节", "end_section", "endsection"],
+  sections: ["节次", "上课节次", "课程节次", "上课时间", "sections", "section"],
   startTime: [],
   endTime: [],
   weeks: ["周次", "起止周", "教学周", "weeks"],
@@ -50,30 +52,49 @@ export function normalizeImportedCourses(rows: Array<Partial<ImportedCourse>>): 
   return rows.map((row, index) => normalizeCourse(row, index));
 }
 
+/** Remove common HTML entities that occasionally appear in exported course names. */
+export function cleanImportedCourseName(value: string): string {
+  return value
+    .replace(/&(?:nbsp|ensp|emsp|thinsp|zwnj|zwj|amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);?/gi, " ")
+    .replace(/\\u00a0/gi, " ")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function parseTabularRows(rows: Record<string, unknown>[]): ImportedCourse[] {
   if (!rows.length) throw new Error("课表文件为空");
   const headers = Object.keys(rows[0]!);
-  const mapping = new Map<keyof ImportedCourse, string>();
+  const mapping = new Map<CourseColumn, string>();
   for (const header of headers) {
     const normalized = header.trim().toLowerCase();
-    for (const [target, choices] of Object.entries(aliases) as Array<[keyof ImportedCourse, string[]]>) {
+    for (const [target, choices] of Object.entries(aliases) as Array<[CourseColumn, string[]]>) {
       if (choices.some((choice) => choice.toLowerCase() === normalized)) mapping.set(target, header);
     }
   }
-  for (const required of ["name", "weekday", "startSection", "endSection", "weeks"] as const) {
+  for (const required of ["name", "weekday", "weeks"] as const) {
     if (!mapping.has(required)) throw new Error(`无法识别“${aliases[required][0]}”列`);
+  }
+  if (!mapping.has("sections") && !mapping.has("startSection")) {
+    throw new Error("无法识别“节次”或“开始节次”列");
   }
   return rows
     .filter((row) => String(row[mapping.get("name") ?? ""] ?? "").trim())
-    .map((row, index) => normalizeCourse({
-      name: String(row[mapping.get("name") ?? ""] ?? ""),
-      teacher: String(row[mapping.get("teacher") ?? ""] ?? ""),
-      location: String(row[mapping.get("location") ?? ""] ?? ""),
-      weekday: parseWeekday(row[mapping.get("weekday") ?? ""]),
-      startSection: Number(row[mapping.get("startSection") ?? ""]),
-      endSection: Number(row[mapping.get("endSection") ?? ""]),
-      weeks: String(row[mapping.get("weeks") ?? ""] ?? ""),
-    }, index));
+    .map((row, index) => {
+      const combinedValue = row[mapping.get("sections") ?? mapping.get("startSection") ?? ""];
+      const [startSection, inferredEndSection] = parseSectionRange(combinedValue);
+      const endValue = mapping.has("endSection") ? row[mapping.get("endSection")!] : undefined;
+      const [, explicitEndSection] = parseSectionRange(endValue, inferredEndSection);
+      return normalizeCourse({
+        name: String(row[mapping.get("name") ?? ""] ?? ""),
+        teacher: String(row[mapping.get("teacher") ?? ""] ?? ""),
+        location: String(row[mapping.get("location") ?? ""] ?? ""),
+        weekday: parseWeekday(row[mapping.get("weekday") ?? ""]),
+        startSection,
+        endSection: endValue === undefined || String(endValue).trim() === "" ? inferredEndSection : explicitEndSection,
+        weeks: String(row[mapping.get("weeks") ?? ""] ?? ""),
+      }, index);
+    });
 }
 
 function parseBuptMatrix(matrix: unknown[][]): ImportedCourse[] {
@@ -118,7 +139,7 @@ function parseBuptMatrix(matrix: unknown[][]): ImportedCourse[] {
 }
 
 function normalizeCourse(row: Partial<ImportedCourse>, index: number): ImportedCourse {
-  const name = String(row.name ?? "").trim();
+  const name = cleanImportedCourseName(String(row.name ?? ""));
   const weekday = parseWeekday(row.weekday);
   const startSection = Number(row.startSection);
   const endSection = Number(row.endSection);
@@ -126,8 +147,12 @@ function normalizeCourse(row: Partial<ImportedCourse>, index: number): ImportedC
   if (!Number.isInteger(startSection) || !Number.isInteger(endSection) || startSection < 1 || endSection < startSection || endSection > 20) {
     throw new Error(`第 ${index + 2} 行节次无效`);
   }
-  const weeks = String(row.weeks ?? "").trim().replace(/周/g, "").replace(/[~～]/g, "-");
-  if (!/^\d+(?:-\d+)?(?:[,，]\d+(?:-\d+)?)*$/.test(weeks)) throw new Error(`第 ${index + 2} 行周次格式无效`);
+  let weeks: string;
+  try {
+    weeks = normalizeWeeks(String(row.weeks ?? ""));
+  } catch {
+    throw new Error(`第 ${index + 2} 行周次格式无效`);
+  }
   return {
     name,
     teacher: String(row.teacher ?? "").trim() || "未填写",
@@ -136,8 +161,28 @@ function normalizeCourse(row: Partial<ImportedCourse>, index: number): ImportedC
     startSection,
     endSection,
     ...courseTimes(startSection, endSection),
-    weeks: `${weeks.replace(/,/g, "、")} 周`,
+    weeks,
   };
+}
+
+/** Normalize inputs such as "1，2，3" to the compact range "1-3". */
+export function normalizeWeeks(value: string): string {
+  const text = value.trim().replace(/周/g, "").replace(/[~～—–至]/g, "-").replace(/，/g, ",").replace(/\s+/g, "");
+  if (!text || !/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(text)) throw new Error("周次格式无效");
+  const ranges = text.split(",").map((part) => {
+    const [startText, endText] = part.split("-");
+    const start = Number(startText);
+    const end = Number(endText ?? startText);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) throw new Error("周次格式无效");
+    return [start, end] as const;
+  }).sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  const merged: Array<[number, number]> = [];
+  for (const [start, end] of ranges) {
+    const previous = merged.at(-1);
+    if (previous && start <= previous[1] + 1) previous[1] = Math.max(previous[1], end);
+    else merged.push([start, end]);
+  }
+  return merged.map(([start, end]) => start === end ? String(start) : `${start}-${end}`).join(",");
 }
 
 function parseWeekday(value: unknown): number {
@@ -147,4 +192,13 @@ function parseWeekday(value: unknown): number {
   const result = names[text] ?? Number(text);
   if (!Number.isInteger(result) || result < 1 || result > 7) throw new Error(`无法识别星期“${String(value)}”`);
   return result;
+}
+
+function parseSectionRange(value: unknown, fallback = Number.NaN): [number, number] {
+  const sections = String(value ?? "")
+    .replace(/[~～—–至]/g, "-")
+    .match(/\d+/g)
+    ?.map(Number) ?? [];
+  if (!sections.length) return [fallback, fallback];
+  return [Math.min(...sections), Math.max(...sections)];
 }

@@ -1,4 +1,4 @@
-export type PageId = "today" | "tasks" | "courses" | "campus" | "assistant" | "notifications" | "settings";
+export type PageId = "today" | "tasks" | "courses" | "campus" | "electricity" | "assistant" | "notifications" | "settings";
 export type TaskStatus = "todo" | "done";
 export type CampusKind = "notice" | "activity";
 
@@ -8,6 +8,7 @@ export interface StudyTask {
   course: string;
   dueAt: string;
   reminderMinutes: number | null;
+  remindDuringQuiet: boolean;
   status: TaskStatus;
   createdAt: string;
 }
@@ -24,7 +25,7 @@ export interface Course {
   endTime: string;
   weeks: string;
   reminderMinutes: number;
-  color: "blue" | "violet" | "green" | "orange";
+  color: "blue" | "violet" | "green" | "orange" | "rose" | "cyan" | "indigo" | "teal";
 }
 
 export interface CampusItem {
@@ -40,6 +41,15 @@ export interface CampusItem {
   eventTime?: string;
   subscribed: boolean;
   read: boolean;
+}
+
+export interface ElectricityResult {
+  dormitory: string;
+  balance: number;
+  unit: "元" | "度";
+  updatedAt: string;
+  queriedAt: string;
+  sourceUrl: string;
 }
 
 export interface AppNotification {
@@ -63,13 +73,38 @@ export interface AssistantMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  attachments?: AssistantAttachment[];
   action?: AssistantAction;
+}
+
+export interface AssistantToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+export interface AssistantAttachment {
+  id: string;
+  name: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp";
+  size: number;
+  dataUrl: string;
+}
+
+export interface AssistantConversation {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  thinkingEnabled: boolean;
+  messages: AssistantMessage[];
 }
 
 export interface Preferences {
   theme: "system" | "light" | "dark";
   courseReminder: number;
   defaultTaskReminder: number;
+  semesterStart: string;
   quietStart: string;
   quietEnd: string;
   browserNotifications: boolean;
