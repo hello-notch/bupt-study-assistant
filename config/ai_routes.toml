@@ -1,0 +1,55 @@
+[providers.gpt_gateway]
+credential_host = "chat.ekti.cc"
+api_prefix = "/v1"
+
+[providers.deepseek]
+credential_host = "api.deepseek.com"
+api_prefix = ""
+
+[tasks.chat]
+primary = "deepseek/deepseek-v4-flash"
+fallbacks = ["gpt_gateway/gpt-5.6-terra"]
+temperature = 0.75
+max_tokens = 1800
+
+[tasks.tool_planner]
+primary = "deepseek/deepseek-v4-flash"
+fallbacks = ["gpt_gateway/gpt-5.6-terra"]
+temperature = 0.2
+max_tokens = 1000
+
+[tasks.proactive_gate]
+primary = "deepseek/deepseek-v4-flash"
+fallbacks = ["gpt_gateway/gpt-5.5"]
+temperature = 0.0
+max_tokens = 120
+
+[tasks.summary]
+primary = "deepseek/deepseek-v4-flash"
+fallbacks = ["gpt_gateway/gpt-5.5"]
+temperature = 0.2
+max_tokens = 1400
+
+[tasks.stats_analysis]
+primary = "deepseek/deepseek-v4-flash"
+fallbacks = ["gpt_gateway/gpt-5.5"]
+temperature = 0.2
+max_tokens = 900
+
+[tasks.memory_extraction]
+primary = "deepseek/deepseek-v4-flash"
+fallbacks = ["gpt_gateway/gpt-5.5"]
+temperature = 0.0
+max_tokens = 700
+
+[tasks.vision]
+primary = "deepseek/deepseek-v4-flash-vision-exp"
+fallbacks = ["gpt_gateway/gpt-5.6-terra"]
+temperature = 0.2
+max_tokens = 1000
+
+[tasks.complex_reasoning]
+primary = "gpt_gateway/gpt-5.6-terra"
+fallbacks = ["deepseek/deepseek-v4-flash"]
+temperature = 0.25
+max_tokens = 2400
