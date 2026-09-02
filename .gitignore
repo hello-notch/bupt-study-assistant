@@ -20,6 +20,8 @@ test-results/
 web/node_modules/
 web/dist/
 web/.vite/
+client/node_modules/
+client/dist/
 *.tsbuildinfo
 
 # Local coding-agent workspace metadata

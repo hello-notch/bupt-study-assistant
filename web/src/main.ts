@@ -1,5 +1,5 @@
 import { createApp } from "vue";
-import App from "./App.vue";
+import AuthGate from "./AuthGate.vue";
 import "./styles.css";
 
-createApp(App).mount("#app");
+createApp(AuthGate).mount("#app");

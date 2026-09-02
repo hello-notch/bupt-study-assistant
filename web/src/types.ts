@@ -91,6 +91,13 @@ export interface AssistantAttachment {
   dataUrl: string;
 }
 
+export interface AssistantTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimated?: boolean;
+}
+
 export interface AssistantConversation {
   id: string;
   title: string;
@@ -98,10 +105,12 @@ export interface AssistantConversation {
   updatedAt: string;
   thinkingEnabled: boolean;
   messages: AssistantMessage[];
+  tokenUsage?: AssistantTokenUsage;
 }
 
 export interface Preferences {
   theme: "system" | "light" | "dark";
+  reduceMotion: boolean;
   courseReminder: number;
   defaultTaskReminder: number;
   semesterStart: string;

@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, isAbsolute, resolve } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -12,6 +12,10 @@ type CampusSessionSource = "portal" | "jwgl" | "activity";
 class CampusSessionExpiredError extends Error {}
 
 const campusSessionRenewals = new Map<CampusSessionSource, Promise<void>>();
+interface AuthUserRecord { id: string; nickname: string; passwordHash: string; createdAt: string; }
+interface AuthSessionRecord { userId: string; expiresAt: number; rememberMe: boolean; }
+const authSessions = new Map<string, AuthSessionRecord>();
+const AUTH_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 interface AssistantRuntimeInfo {
   provider: string;
   model: string;
@@ -19,6 +23,9 @@ interface AssistantRuntimeInfo {
   thinkingEnabled?: boolean;
   webSearchEnabled?: boolean;
   allowedFileTypes?: string[];
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  contextBlockThreshold?: number;
 }
 interface ElectricityDormitory {
   compact: string;
@@ -39,6 +46,35 @@ export function localWebApi(): Plugin {
     name: "youxueban-local-web-api",
     configureServer(server) {
       server.middlewares.use(async (request, response, next) => {
+        const pathname = request.url?.split("?", 1)[0] ?? "";
+        if (request.method === "POST" && request.url === "/api/v1/auth/register") {
+          await handleAuthRegister(request, response, projectRoot);
+          return;
+        }
+        if (request.method === "POST" && request.url === "/api/v1/auth/login") {
+          await handleAuthLogin(request, response, projectRoot);
+          return;
+        }
+        if (request.method === "POST" && request.url === "/api/v1/auth/password") {
+          await handleAuthPassword(request, response, projectRoot);
+          return;
+        }
+        if (request.method === "GET" && request.url === "/api/v1/auth/me") {
+          await handleAuthMe(request, response, projectRoot);
+          return;
+        }
+        if (request.method === "POST" && request.url === "/api/v1/auth/refresh") {
+          await handleAuthRefresh(request, response, projectRoot);
+          return;
+        }
+        if (request.method === "POST" && request.url === "/api/v1/auth/logout") {
+          await handleAuthLogout(request, response);
+          return;
+        }
+        if (pathname.startsWith("/api/") && !findAuthUser(request, projectRoot)) {
+          sendJson(response, 401, { error: "请先登录邮学伴" });
+          return;
+        }
         if (request.method === "GET" && request.url === "/api/config") {
           const assistant = aiTaskRuntimeConfig(projectRoot, env, "chat");
           sendJson(response, 200, {
@@ -77,6 +113,172 @@ export function localWebApi(): Plugin {
   };
 }
 
+async function handleAuthRegister(request: IncomingMessage, response: ServerResponse, projectRoot: string): Promise<void> {
+  try {
+    const body = await readJson(request);
+    const nickname = String(body.nickname ?? "").trim();
+    const password = String(body.password ?? "");
+    const rememberMe = body.rememberMe === true;
+    if (body.agreedToTerms !== true) return sendJson(response, 400, { error: "注册前必须同意用户协议与隐私说明" });
+    if (!nickname || nickname.length > 20) return sendJson(response, 400, { error: "昵称长度应为 1 到 20 个字符" });
+    if (password.length < 6 || password.length > 128) return sendJson(response, 400, { error: "密码长度应为 6 到 128 个字符" });
+    const users = readAuthUsers(projectRoot);
+    if (users.some((item) => item.nickname === nickname)) return sendJson(response, 409, { error: "该昵称已注册" });
+    const user: AuthUserRecord = {
+      id: randomBytes(16).toString("hex"),
+      nickname,
+      passwordHash: hashAuthPassword(password),
+      createdAt: new Date().toISOString(),
+    };
+    users.push(user);
+    writeAuthUsers(projectRoot, users);
+    const session = issueAuthSession(user.id, response, rememberMe);
+    sendJson(response, 201, { user: publicAuthUser(user), accessToken: session });
+  } catch (error) {
+    sendJson(response, 500, { error: safeError(error) });
+  }
+}
+
+async function handleAuthLogin(request: IncomingMessage, response: ServerResponse, projectRoot: string): Promise<void> {
+  try {
+    const body = await readJson(request);
+    const nickname = String(body.nickname ?? "").trim();
+    const password = String(body.password ?? "");
+    const rememberMe = body.rememberMe === true;
+    const user = readAuthUsers(projectRoot).find((item) => item.nickname === nickname);
+    if (!user || !verifyAuthPassword(password, user.passwordHash)) return sendJson(response, 401, { error: "昵称或密码错误" });
+    const session = issueAuthSession(user.id, response, rememberMe);
+    sendJson(response, 200, { user: publicAuthUser(user), accessToken: session });
+  } catch (error) {
+    sendJson(response, 500, { error: safeError(error) });
+  }
+}
+
+async function handleAuthPassword(request: IncomingMessage, response: ServerResponse, projectRoot: string): Promise<void> {
+  try {
+    const user = findAuthUser(request, projectRoot);
+    if (!user) return sendJson(response, 401, { error: "登录已失效，请重新登录" });
+    const body = await readJson(request);
+    const currentPassword = String(body.currentPassword ?? "");
+    const newPassword = String(body.newPassword ?? "");
+    const confirmPassword = String(body.confirmPassword ?? "");
+    if (!verifyAuthPassword(currentPassword, user.passwordHash)) return sendJson(response, 401, { error: "原密码错误" });
+    if (newPassword.length < 6 || newPassword.length > 128) return sendJson(response, 400, { error: "新密码长度应为 6 到 128 个字符" });
+    if (newPassword !== confirmPassword) return sendJson(response, 400, { error: "两次输入的新密码不一致" });
+    if (newPassword === currentPassword) return sendJson(response, 400, { error: "新密码不能与原密码相同" });
+    const users = readAuthUsers(projectRoot);
+    const target = users.find((item) => item.id === user.id);
+    if (!target) return sendJson(response, 404, { error: "账号不存在" });
+    target.passwordHash = hashAuthPassword(newPassword);
+    writeAuthUsers(projectRoot, users);
+    for (const [token, session] of authSessions) {
+      if (session.userId === user.id) authSessions.delete(token);
+    }
+    response.setHeader("Set-Cookie", expireRefreshCookie());
+    sendJson(response, 200, { ok: true });
+  } catch (error) {
+    sendJson(response, 500, { error: safeError(error) });
+  }
+}
+
+async function handleAuthMe(request: IncomingMessage, response: ServerResponse, projectRoot: string): Promise<void> {
+  const user = findAuthUser(request, projectRoot);
+  if (!user) return sendJson(response, 401, { error: "登录已失效" });
+  sendJson(response, 200, { user: publicAuthUser(user) });
+}
+
+async function handleAuthRefresh(request: IncomingMessage, response: ServerResponse, projectRoot: string): Promise<void> {
+  const refresh = request.headers.cookie?.match(/(?:^|;\s*)youxueban_refresh=([^;]+)/)?.[1];
+  const session = refresh ? authSessions.get(refresh) : undefined;
+  if (!session || session.expiresAt <= Date.now()) {
+    if (refresh) authSessions.delete(refresh);
+    response.setHeader("Set-Cookie", expireRefreshCookie());
+    return sendJson(response, 401, { error: "登录已失效" });
+  }
+  const user = readAuthUsers(projectRoot).find((item) => item.id === session.userId);
+  if (!user) return sendJson(response, 401, { error: "账号不存在" });
+  authSessions.delete(refresh!);
+  const accessToken = issueAuthSession(user.id, response, session.rememberMe);
+  sendJson(response, 200, { user: publicAuthUser(user), accessToken });
+}
+
+async function handleAuthLogout(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const refresh = request.headers.cookie?.match(/(?:^|;\s*)youxueban_refresh=([^;]+)/)?.[1];
+  if (refresh) authSessions.delete(refresh);
+  response.setHeader("Set-Cookie", expireRefreshCookie());
+  sendJson(response, 200, { ok: true });
+}
+
+function authDataPath(projectRoot: string): string {
+  return resolve(projectRoot, "data", "web-auth-users.json");
+}
+
+function readAuthUsers(projectRoot: string): AuthUserRecord[] {
+  const path = authDataPath(projectRoot);
+  if (!existsSync(path)) return [];
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    return Array.isArray(value) ? value.filter((item): item is AuthUserRecord => (
+      item && typeof item.id === "string" && typeof item.nickname === "string" && typeof item.passwordHash === "string"
+    )) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeAuthUsers(projectRoot: string, users: AuthUserRecord[]): void {
+  const path = authDataPath(projectRoot);
+  mkdirSync(resolve(projectRoot, "data"), { recursive: true });
+  writeFileSync(path, JSON.stringify(users, null, 2), { encoding: "utf8", mode: 0o600 });
+}
+
+function hashAuthPassword(password: string): string {
+  const salt = randomBytes(16).toString("hex");
+  const digest = scryptSync(password, salt, 32).toString("hex");
+  return `scrypt$${salt}$${digest}`;
+}
+
+function verifyAuthPassword(password: string, encoded: string): boolean {
+  const [, salt, expected] = encoded.split("$");
+  if (!salt || !expected) return false;
+  try {
+    const actual = scryptSync(password, salt, 32);
+    const target = Buffer.from(expected, "hex");
+    return target.length === actual.length && timingSafeEqual(actual, target);
+  } catch {
+    return false;
+  }
+}
+
+function publicAuthUser(user: AuthUserRecord): JsonObject {
+  return { id: user.id, nickname: user.nickname, createdAt: user.createdAt };
+}
+
+function issueAuthSession(userId: string, response: ServerResponse, rememberMe: boolean): string {
+  const accessToken = randomBytes(32).toString("base64url");
+  const refreshToken = randomBytes(32).toString("base64url");
+  authSessions.set(accessToken, { userId, expiresAt: Date.now() + 15 * 60 * 1000, rememberMe });
+  authSessions.set(refreshToken, { userId, expiresAt: Date.now() + AUTH_SESSION_TTL_MS, rememberMe });
+  const maxAge = rememberMe ? `; Max-Age=${Math.floor(AUTH_SESSION_TTL_MS / 1000)}` : "";
+  response.setHeader("Set-Cookie", `youxueban_refresh=${refreshToken}; Path=/api/v1/auth; HttpOnly; SameSite=Lax${maxAge}`);
+  return accessToken;
+}
+
+function findAuthUser(request: IncomingMessage, projectRoot: string): AuthUserRecord | undefined {
+  const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) return undefined;
+  const session = authSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    if (session) authSessions.delete(token);
+    return undefined;
+  }
+  return readAuthUsers(projectRoot).find((item) => item.id === session.userId);
+}
+
+function expireRefreshCookie(): string {
+  return "youxueban_refresh=; Path=/api/v1/auth; HttpOnly; SameSite=Lax; Max-Age=0";
+}
+
 async function handleAssistant(
   request: IncomingMessage,
   response: ServerResponse,
@@ -111,6 +313,15 @@ async function handleAssistant(
     const endpoint = `${credential.url.replace(/\/$/, "")}/${apiPrefix.replace(/^\/+|\/+$/g, "")}`.replace(/\/$/, "");
     const stream = body.stream === true;
     const tools = normalizeAssistantTools(body.tools);
+    const estimatedInputTokens = estimateAssistantJsonTokens([{ role: "system", content: system }, ...messages])
+      + estimateAssistantJsonTokens(tools)
+      + 100;
+    if (runtime.contextBlockThreshold && estimatedInputTokens >= runtime.contextBlockThreshold) {
+      return sendJson(response, 413, {
+        error: "上下文已满，请新建对话后继续",
+        usage: { inputTokens: estimatedInputTokens, outputTokens: 0, totalTokens: estimatedInputTokens, estimated: true },
+      });
+    }
     const upstream = await fetch(`${endpoint}/chat/completions`, {
       method: "POST",
       headers: { Authorization: `Bearer ${credential.key}`, "Content-Type": "application/json" },
@@ -118,7 +329,7 @@ async function handleAssistant(
         model,
         messages: [{ role: "system", content: system }, ...messages],
         temperature: 0.65,
-        max_tokens: 900,
+        max_tokens: runtime.maxOutputTokens ?? 900,
         ...(stream ? { stream: true } : {}),
         ...(tools.length ? { tools, tool_choice: "auto" } : {}),
         ...(runtime.thinkingSupported ? { thinking: { type: thinkingEnabled ? "enabled" : "disabled" } } : {}),
@@ -153,9 +364,11 @@ async function handleAssistant(
     const toolCalls = normalizeAssistantToolCalls(message?.tool_calls);
     const reply = (typeof message?.content === "string" ? message.content : "").trim();
     if (!reply && !toolCalls.length) return sendJson(response, 502, { error: "AI 服务没有返回正文或工具调用" });
+    const usage = normalizeAssistantUsage(payload.usage, estimatedInputTokens, reply);
     sendJson(response, 200, {
       ...(reply ? { reply } : {}),
       ...(toolCalls.length ? { toolCalls } : {}),
+      usage,
       mode: "online",
       ...runtime,
       ...(runtime.thinkingSupported ? { thinkingEnabled } : {}),
@@ -721,6 +934,8 @@ function aiTaskRuntimeConfig(projectRoot: string, env: NodeJS.ProcessEnv, task: 
   const thinking = /^thinking_enabled\s*=\s*(true|false)/m.exec(taskSection)?.[1];
   const thinkingSupported = /^thinking_supported\s*=\s*(true|false)/m.exec(taskSection)?.[1];
   const webSearch = /^web_search_enabled\s*=\s*(true|false)/m.exec(taskSection)?.[1];
+  const maxOutputTokens = Number(/^max_tokens\s*=\s*(\d+)/m.exec(taskSection)?.[1] ?? 0);
+  const contextWindow = Number(/^context_window\s*=\s*(\d+)/m.exec(taskSection)?.[1] ?? 0);
   const fileTypes = /^file_types\s*=\s*\[([^\]]*)\]/m.exec(taskSection)?.[1]
     ?.split(",").map((item) => item.trim().replace(/^"|"$/g, "")).filter(Boolean);
   return {
@@ -730,6 +945,8 @@ function aiTaskRuntimeConfig(projectRoot: string, env: NodeJS.ProcessEnv, task: 
     ...(thinking ? { thinkingEnabled: thinking === "true" } : {}),
     ...(webSearch ? { webSearchEnabled: webSearch === "true" } : {}),
     ...(fileTypes?.length ? { allowedFileTypes: fileTypes } : {}),
+    ...(maxOutputTokens > 0 ? { maxOutputTokens } : {}),
+    ...(contextWindow > 0 ? { contextWindow, contextBlockThreshold: Math.floor(contextWindow * 0.9) } : {}),
   };
 }
 
@@ -805,6 +1022,36 @@ function normalizeAssistantMessages(value: unknown, allowedFileTypes: string[]):
     }
     return { role, content };
   });
+}
+
+function estimateAssistantJsonTokens(value: unknown): number {
+  if (typeof value === "string") {
+    if (/^data:image\/(?:png|jpeg|webp);base64,/i.test(value)) return 1_100;
+    return Math.ceil(Buffer.byteLength(value, "utf8") / 3);
+  }
+  if (typeof value === "number" || typeof value === "boolean") return 1;
+  if (Array.isArray(value)) return 2 + value.reduce((total, item) => total + estimateAssistantJsonTokens(item), 0);
+  if (value && typeof value === "object") {
+    return 2 + Object.entries(value).reduce((total, [key, item]) => (
+      total + estimateAssistantJsonTokens(key) + estimateAssistantJsonTokens(item)
+    ), 0);
+  }
+  return 0;
+}
+
+function normalizeAssistantUsage(value: unknown, estimatedInputTokens: number, reply: string): JsonObject {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+  const inputTokens = Math.max(0, Math.floor(Number(raw.prompt_tokens) || 0));
+  const outputTokens = Math.max(0, Math.floor(Number(raw.completion_tokens) || 0));
+  const totalTokens = Math.max(inputTokens + outputTokens, Math.floor(Number(raw.total_tokens) || 0));
+  if (totalTokens > 0) return { inputTokens, outputTokens, totalTokens };
+  const estimatedOutputTokens = estimateAssistantJsonTokens(reply);
+  return {
+    inputTokens: estimatedInputTokens,
+    outputTokens: estimatedOutputTokens,
+    totalTokens: estimatedInputTokens + estimatedOutputTokens,
+    estimated: true,
+  };
 }
 
 function normalizeAssistantTools(value: unknown): JsonObject[] {

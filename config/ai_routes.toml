@@ -11,6 +11,7 @@ primary = "deepseek/deepseek-v4-flash-vision-exp"
 fallbacks = ["gpt_gateway/gpt-5.6-terra"]
 temperature = 0.75
 max_tokens = 1800
+context_window = 128000
 thinking_supported = true
 thinking_enabled = false
 file_types = ["image/png", "image/jpeg", "image/webp"]

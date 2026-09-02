@@ -1,0 +1,39 @@
+{
+  "name": "youxueban-client",
+  "private": true,
+  "version": "0.1.0",
+  "description": "邮学伴桌面客户端",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "build:web": "pnpm --dir ../web run build",
+    "dist:win": "pnpm run build:web && node build-win.cjs"
+  },
+  "devDependencies": {
+    "electron": "^38.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "cn.edu.bupt.youxueban",
+    "productName": "邮学伴",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "package.json",
+      {
+        "from": "../web/dist",
+        "to": "web/dist",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {}
+  }
+}

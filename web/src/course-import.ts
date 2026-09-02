@@ -19,8 +19,8 @@ const aliases: Record<CourseColumn, string[]> = {
 
 const sectionTimes: Record<number, string> = {
   1: "08:00", 2: "08:50", 3: "09:50", 4: "10:40", 5: "11:30",
-  6: "13:30", 7: "14:20", 8: "15:20", 9: "16:10", 10: "17:00",
-  11: "18:30", 12: "19:20", 13: "20:10", 14: "21:00",
+  6: "13:00", 7: "13:50", 8: "14:45", 9: "15:40", 10: "16:35",
+  11: "17:25", 12: "18:30", 13: "19:20", 14: "20:10",
 };
 
 export function courseTimes(startSection: number, endSection: number): { startTime: string; endTime: string } {
