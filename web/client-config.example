@@ -1,0 +1,4 @@
+# Copy this file to web/.env before building a desktop client that bundles the UI.
+# Use an address reachable from every test device; 127.0.0.1 means that device itself.
+# Prefer a stable HTTPS domain for any test outside a trusted local network.
+VITE_API_BASE_URL=https://youxueban.example.com

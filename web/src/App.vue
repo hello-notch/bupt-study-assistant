@@ -4,10 +4,12 @@ import "katex/dist/katex.min.css";
 import IconGlyph from "./components/IconGlyph.vue";
 import { renderAssistantContent } from "./assistant-markdown";
 import { courseTimes, normalizeImportedCourses, normalizeWeeks, parseCourseFile, type ImportedCourse } from "./course-import";
+import { apiFetch, clearSavedLogin, logoutSession, setAccessToken } from "./auth";
 import type {
   AssistantAttachment,
   AssistantConversation,
   AssistantMessage,
+  AssistantTokenUsage,
   AssistantToolCall,
   AppNotification,
   CampusItem,
@@ -27,6 +29,9 @@ interface AssistantRuntimeInfo {
   thinkingEnabled?: boolean;
   webSearchEnabled?: boolean;
   allowedFileTypes?: string[];
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  contextBlockThreshold?: number;
 }
 interface CampusSourceStatus {
   source: "portal" | "activity";
@@ -47,11 +52,18 @@ interface WelcomeOrb {
 interface AssistantToolResponse {
   reply?: string;
   toolCalls?: AssistantToolCall[];
+  usage?: AssistantTokenUsage;
   error?: string;
 }
 interface AssistantToolResult {
   success: boolean;
   [key: string]: unknown;
+}
+
+class AssistantCompletionError extends Error {
+  constructor(message: string, readonly usage?: AssistantTokenUsage) {
+    super(message);
+  }
 }
 
 const assistantTools: Array<Record<string, unknown>> = [
@@ -94,10 +106,12 @@ function assistantFunction(name: string, description: string, properties: Record
   return { type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } };
 }
 
-const STORAGE_KEY = "youxueban-state-v7";
-const LEGACY_STORAGE_KEYS = ["youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
+const STORAGE_KEY = "youxueban-state-v8";
+const LEGACY_STORAGE_KEYS = ["youxueban-state-v7", "youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
 const MAX_ASSISTANT_FILE_SIZE = 1_000_000;
 const MAX_ASSISTANT_ATTACHMENTS = 2;
+const ASSISTANT_TOKEN_ESTIMATE_OVERHEAD = 300;
+const ASSISTANT_IMAGE_TOKEN_ESTIMATE = 1_100;
 const MAX_ACADEMIC_WEEK = 22;
 const ASSISTANT_GREETING = "你好，你可以问我学习问题。我可以结合你的课程、DDL、校园通知和电费回答问题，也能按你的要求查看或编辑课程和 DDL。";
 const LEGACY_ASSISTANT_GREETING = "你好，我可以结合你的课程、任务与校园信息回答问题，也能帮你规划学习安排。";
@@ -122,12 +136,20 @@ const navItems: Array<{ id: PageId; label: string; icon: string }> = [
   { id: "electricity", label: "查电费", icon: "electricity" },
   { id: "assistant", label: "助手", icon: "assistant" },
 ];
+const mobilePrimaryNavItems = navItems.filter((item) => ["today", "tasks", "courses", "assistant"].includes(item.id));
+const mobileMoreNavItems: Array<{ id: PageId; label: string; icon: string; description: string }> = [
+  { id: "campus", label: "校园服务", icon: "campus", description: "通知与第二课堂" },
+  { id: "electricity", label: "宿舍电费", icon: "electricity", description: "查询余额与提醒" },
+  { id: "notifications", label: "消息中心", icon: "bell", description: "课程、任务与订阅" },
+  { id: "settings", label: "偏好设置", icon: "settings", description: "外观、提醒与隐私" },
+];
 
 const defaultPreferences: Preferences = {
   theme: "system",
+  reduceMotion: false,
   courseReminder: 20,
   defaultTaskReminder: 60,
-  semesterStart: mondayOf(new Date()).toISOString().slice(0, 10),
+  semesterStart: "2026-08-30",
   quietStart: "23:00",
   quietEnd: "07:00",
   browserNotifications: true,
@@ -158,8 +180,37 @@ const saved = (() => {
   }
 })();
 
-const currentPage = ref<PageId>("today");
-const profileName = ref(saved.profileName?.trim() ?? "");
+const initialPageHash = location.hash.replace("#/", "") as PageId;
+const initialPage = [...navItems.map((item) => item.id), "notifications", "settings"].includes(initialPageHash) ? initialPageHash : "today";
+const currentPage = ref<PageId>(initialPage);
+const mobileMoreOpen = ref(false);
+const sidebarRef = ref<HTMLElement | null>(null);
+const sidebarGlider = ref({ top: 0, height: 46, visible: false });
+const sidebarGliderReady = ref(false);
+const sidebarGliderStyle = computed(() => ({
+  height: `${sidebarGlider.value.height}px`,
+  opacity: sidebarGlider.value.visible ? "1" : "0",
+  transform: `translate3d(0, ${sidebarGlider.value.top}px, 0)`,
+}));
+const conversationListRef = ref<HTMLElement | null>(null);
+const conversationGlider = ref({ x: 0, y: 0, width: 0, height: 0, visible: false });
+const conversationGliderReady = ref(false);
+const conversationGliderStyle = computed(() => ({
+  width: `${conversationGlider.value.width}px`,
+  height: `${conversationGlider.value.height}px`,
+  opacity: conversationGlider.value.visible ? "1" : "0",
+  transform: `translate3d(${conversationGlider.value.x}px, ${conversationGlider.value.y}px, 0)`,
+}));
+const authNickname = (() => {
+  try {
+    const raw = sessionStorage.getItem("youxueban-auth-user");
+    const value = raw ? JSON.parse(raw) as { nickname?: unknown } : {};
+    return typeof value.nickname === "string" ? value.nickname.trim() : "";
+  } catch {
+    return "";
+  }
+})();
+const profileName = ref(saved.profileName?.trim() || authNickname);
 const profileAvatar = ref(isImageDataUrl(saved.profileAvatar) ? saved.profileAvatar : "");
 const profileDraftName = ref(profileName.value);
 const profileDraftAvatar = ref(profileAvatar.value);
@@ -174,9 +225,15 @@ const courses = ref<Course[]>(normalizeCourseColors((saved.courses ?? []).map((c
 const campusItems = ref<CampusItem[]>((saved.campusItems ?? []).filter(isCampusItemReadable));
 const notifications = ref<AppNotification[]>(saved.notifications ?? []);
 const preferences = ref<Preferences>({ ...defaultPreferences, ...saved.preferences });
+if (preferences.value.semesterStart === "2026-08-24" || preferences.value.semesterStart === "2026-09-07") {
+  preferences.value.semesterStart = "2026-08-30";
+}
 const reminderParts = splitReminder(preferences.value.defaultTaskReminder);
-const defaultTaskReminderValue = ref(reminderParts.value);
+const defaultTaskReminderValue = ref(String(reminderParts.value));
 const defaultTaskReminderUnit = ref<ReminderUnit>(reminderParts.unit);
+const lastValidTaskReminderMinutes = ref(preferences.value.defaultTaskReminder);
+const courseReminderValue = ref(String(preferences.value.courseReminder));
+const lastValidCourseReminder = ref(preferences.value.courseReminder);
 const toast = ref("");
 const taskModalOpen = ref(false);
 const courseImportOpen = ref(false);
@@ -215,6 +272,7 @@ const assistantRuntime = ref<AssistantRuntimeInfo | null>(null);
 const assistantAttachments = ref<AssistantAttachment[]>([]);
 const assistantFileInput = ref<HTMLInputElement | null>(null);
 const assistantTextarea = ref<HTMLTextAreaElement | null>(null);
+const assistantChatPanel = ref<HTMLElement | null>(null);
 const assistantDeleteConfirmId = ref<string | null>(null);
 const deleteConfirmId = ref<number | null>(null);
 const courseDeleteConfirming = ref(false);
@@ -230,6 +288,12 @@ const electricityResult = ref<ElectricityResult | null>(null);
 const electricityBusy = ref(false);
 const electricityError = ref("");
 const electricityEditing = ref(!electricityDormitory.value);
+const accountLogoutBusy = ref(false);
+const accountLogoutConfirmOpen = ref(false);
+const passwordChangeBusy = ref(false);
+const passwordChangeOpen = ref(false);
+const passwordChangeError = ref("");
+const passwordChangeForm = ref({ currentPassword: "", newPassword: "", confirmPassword: "" });
 const sidebarWidth = ref(Math.max(190, Math.min(320, Number(saved.sidebarWidth) || 224)));
 let clockTimer: number | undefined;
 let reminderTimer: number | undefined;
@@ -238,6 +302,11 @@ let courseClearConfirmTimer: number | undefined;
 let courseDeleteConfirmTimer: number | undefined;
 let assistantDeleteConfirmTimer: number | undefined;
 let sidebarResizeCleanup: (() => void) | undefined;
+let sidebarGliderFrame: number | undefined;
+let sidebarGliderResizeObserver: ResizeObserver | undefined;
+let conversationGliderFrame: number | undefined;
+let conversationGliderResizeObserver: ResizeObserver | undefined;
+let observedConversationList: HTMLElement | null = null;
 let welcomeAnimationFrame: number | undefined;
 let welcomeResizeObserver: ResizeObserver | undefined;
 let welcomePreviousTime = 0;
@@ -273,7 +342,7 @@ const profileInitial = computed(() => profileName.value.trim().slice(0, 1) || "�
 const unreadCount = computed(() => notifications.value.filter((item) => !item.read).length);
 const todoTasks = computed(() => tasks.value.filter((task) => task.status === "todo").sort((a, b) => a.dueAt.localeCompare(b.dueAt)));
 const currentAcademicWeek = computed(() => weekNumberFor(clock.value));
-const weekStart = computed(() => addDays(semesterStartDate(), (selectedWeek.value - 1) * 7));
+const weekStart = computed(() => academicWeekMonday(selectedWeek.value));
 const weekDates = computed(() => weekdays.map((label, index) => ({ label, date: addDays(weekStart.value, index) })));
 const visibleCourses = computed(() => courses.value
   .filter((course) => courseOccursInWeek(course, selectedWeek.value))
@@ -303,6 +372,25 @@ const assistantThinkingEnabled = computed({
 const assistantModelLabel = computed(() => assistantRuntime.value?.model === "deepseek-v4-flash-vision-exp"
   ? "DeepSeek-V4-Flash-Vision-Exp"
   : assistantRuntime.value?.model ?? "");
+const assistantContextThreshold = computed(() => assistantRuntime.value?.contextBlockThreshold
+  ?? Math.floor((assistantRuntime.value?.contextWindow ?? 0) * 0.9));
+const assistantContextBaseTokens = computed(() => activeConversation.value.tokenUsage?.totalTokens
+  ?? estimateAssistantConversationTokens(activeConversation.value));
+const assistantPendingTokens = computed(() => estimateAssistantMessageTokens(assistantInput.value, assistantAttachments.value));
+const assistantContextTokens = computed(() => assistantContextBaseTokens.value + assistantPendingTokens.value);
+const assistantContextPercent = computed(() => assistantRuntime.value?.contextWindow
+  ? Math.min(100, Math.round((assistantContextTokens.value / assistantRuntime.value.contextWindow) * 100))
+  : 0);
+const assistantContextBlocked = computed(() => assistantContextThreshold.value > 0
+  && assistantContextTokens.value >= assistantContextThreshold.value);
+const assistantContextNearLimit = computed(() => assistantContextThreshold.value > 0
+  && assistantContextTokens.value >= assistantContextThreshold.value * 0.8);
+const assistantTokenLabel = computed(() => {
+  const used = formatTokenCount(assistantContextTokens.value);
+  const limit = formatTokenCount(assistantRuntime.value?.contextWindow ?? 0);
+  const approximate = !activeConversation.value.tokenUsage || activeConversation.value.tokenUsage.estimated || assistantPendingTokens.value > 0 ? "约 " : "";
+  return limit ? `${approximate}${used} / ${limit}` : `${approximate}${used}`;
+});
 const filteredTasks = computed(() => {
   const query = taskSearch.value.trim().toLowerCase();
   return tasks.value
@@ -323,6 +411,7 @@ const activityIsEmptyOnline = computed(() => campusTab.value === "activity"
   && !campusSearch.value.trim()
   && campusStatuses.value.some((status) => status.source === "activity" && status.mode === "online" && status.itemCount === 0));
 const activeConversationIsBlank = computed(() => isAssistantConversationBlank(activeConversation.value));
+const listedAssistantConversations = computed(() => assistantConversations.value.filter((conversation) => !isAssistantConversationBlank(conversation)));
 const studySuggestions = computed(() => {
   if (!preferences.value.analyticsEnabled) {
     return [
@@ -357,16 +446,25 @@ watch([profileName, profileAvatar, tasks, courses, campusItems, notifications, p
       sidebarWidth: sidebarWidth.value,
     }));
   } catch {
-    showToast("对话中的图片较多，浏览器存储空间不足");
+    showToast("对话中的图片较多，本机存储空间不足");
   }
 }, { deep: true });
 
-watch([defaultTaskReminderValue, defaultTaskReminderUnit], () => {
-  const factor = defaultTaskReminderUnit.value === "days" ? 1440 : defaultTaskReminderUnit.value === "hours" ? 60 : 1;
-  preferences.value.defaultTaskReminder = Math.max(0, Math.min(10080, Number(defaultTaskReminderValue.value) || 0) * factor);
-});
-
 watch(() => preferences.value.theme, applyTheme, { immediate: true });
+watch(() => preferences.value.reduceMotion, async (reduceMotion) => {
+  applyMotionPreference();
+  if (reduceMotion) {
+    stopWelcomeOrbs();
+    return;
+  }
+  await nextTick();
+  if (!profileName.value) startWelcomeOrbs();
+}, { immediate: true });
+watch(currentPage, () => {
+  updateSidebarGlider();
+  updateConversationGlider();
+});
+watch([activeConversationId, () => listedAssistantConversations.value.length], () => updateConversationGlider());
 
 watch(assistantInput, async () => {
   await nextTick();
@@ -379,7 +477,7 @@ watch(selectedCourse, () => {
 });
 
 watch(profileName, async (name) => {
-  if (name) {
+  if (name || preferences.value.reduceMotion) {
     stopWelcomeOrbs();
     return;
   }
@@ -388,12 +486,12 @@ watch(profileName, async (name) => {
 });
 
 onMounted(async () => {
-  const hash = location.hash.replace("#/", "") as PageId;
-  if ([...navItems.map((item) => item.id), "notifications", "settings"].includes(hash)) currentPage.value = hash;
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+  window.scrollTo({ top: 0, behavior: "auto" });
   clockTimer = window.setInterval(() => { clock.value = new Date(); }, 1000);
   reminderTimer = window.setInterval(checkDueReminders, 15_000);
   try {
-    const response = await fetch("/api/config");
+    const response = await apiFetch("/api/config");
     const payload = await response.json() as { semesterStart?: string; assistant?: AssistantRuntimeInfo };
     if (response.ok && /^\d{4}-\d{2}-\d{2}$/.test(payload.semesterStart ?? "")) preferences.value.semesterStart = payload.semesterStart!;
     if (response.ok && payload.assistant?.model) assistantRuntime.value = payload.assistant;
@@ -402,11 +500,19 @@ onMounted(async () => {
   }
   selectedWeek.value = Math.max(1, Math.min(MAX_ACADEMIC_WEEK, currentAcademicWeek.value));
   await nextTick();
-  if (!profileName.value) startWelcomeOrbs();
+  updateSidebarGlider();
+  updateConversationGlider();
+  if (sidebarRef.value) {
+    sidebarGliderResizeObserver = new ResizeObserver(() => updateSidebarGlider());
+    sidebarGliderResizeObserver.observe(sidebarRef.value);
+  }
+  if (!profileName.value && !preferences.value.reduceMotion) startWelcomeOrbs();
   await Promise.all([
     loadCampusData(),
     electricityDormitory.value ? queryElectricity(true) : Promise.resolve(),
   ]);
+  await nextTick();
+  window.scrollTo({ top: 0, behavior: "auto" });
 });
 
 onBeforeUnmount(() => {
@@ -417,12 +523,20 @@ onBeforeUnmount(() => {
   if (courseDeleteConfirmTimer !== undefined) window.clearTimeout(courseDeleteConfirmTimer);
   if (assistantDeleteConfirmTimer !== undefined) window.clearTimeout(assistantDeleteConfirmTimer);
   sidebarResizeCleanup?.();
+  sidebarGliderResizeObserver?.disconnect();
+  if (sidebarGliderFrame !== undefined) window.cancelAnimationFrame(sidebarGliderFrame);
+  conversationGliderResizeObserver?.disconnect();
+  if (conversationGliderFrame !== undefined) window.cancelAnimationFrame(conversationGliderFrame);
   stopWelcomeOrbs();
 });
 
 function applyTheme(): void {
   const theme = preferences.value.theme;
   document.documentElement.dataset.theme = theme === "system" ? "" : theme;
+}
+
+function applyMotionPreference(): void {
+  document.documentElement.dataset.motion = preferences.value.reduceMotion ? "reduced" : "full";
 }
 
 function blankCourse(): Omit<Course, "id"> {
@@ -465,11 +579,21 @@ function addDays(date: Date, days: number): Date {
 
 function semesterStartDate(): Date {
   const parsed = new Date(`${preferences.value.semesterStart}T00:00:00`);
-  return Number.isNaN(parsed.getTime()) ? mondayOf(clock.value) : mondayOf(parsed);
+  if (!Number.isNaN(parsed.getTime())) return parsed;
+  const fallback = new Date(clock.value);
+  fallback.setHours(0, 0, 0, 0);
+  return fallback;
+}
+
+function academicWeekMonday(week: number): Date {
+  const firstMonday = mondayOf(addDays(semesterStartDate(), 6));
+  return addDays(firstMonday, (week - 1) * 7);
 }
 
 function weekNumberFor(date: Date): number {
-  return Math.max(1, Math.floor((mondayOf(date).getTime() - semesterStartDate().getTime()) / 604800000) + 1);
+  const day = new Date(date);
+  day.setHours(0, 0, 0, 0);
+  return Math.max(1, Math.floor((day.getTime() - semesterStartDate().getTime()) / 604800000) + 1);
 }
 
 function courseOccursInWeek(course: Course, week: number): boolean {
@@ -497,6 +621,65 @@ function splitReminder(minutes: number): { value: number; unit: ReminderUnit } {
   return { value: minutes, unit: "minutes" };
 }
 
+function reminderFactor(unit: ReminderUnit): number {
+  return unit === "days" ? 1440 : unit === "hours" ? 60 : 1;
+}
+
+function reminderMaximum(unit: ReminderUnit): number {
+  return unit === "days" ? 7 : unit === "hours" ? 168 : 10080;
+}
+
+function updateDefaultTaskReminderInput(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  if (!/^\d*$/.test(input.value)) {
+    input.value = defaultTaskReminderValue.value;
+    return;
+  }
+  defaultTaskReminderValue.value = input.value;
+  const value = Number(input.value);
+  if (!input.value || !Number.isInteger(value) || value < 0 || value > reminderMaximum(defaultTaskReminderUnit.value)) return;
+  const minutes = value * reminderFactor(defaultTaskReminderUnit.value);
+  preferences.value.defaultTaskReminder = minutes;
+  lastValidTaskReminderMinutes.value = minutes;
+}
+
+function restoreDefaultTaskReminderInput(): void {
+  const factor = reminderFactor(defaultTaskReminderUnit.value);
+  defaultTaskReminderValue.value = String(Math.round(lastValidTaskReminderMinutes.value / factor));
+}
+
+function changeDefaultTaskReminderUnit(event: Event): void {
+  const unit = (event.target as HTMLSelectElement).value as ReminderUnit;
+  const converted = Math.min(
+    reminderMaximum(unit),
+    lastValidTaskReminderMinutes.value > 0
+      ? Math.max(1, Math.round(lastValidTaskReminderMinutes.value / reminderFactor(unit)))
+      : 0,
+  );
+  defaultTaskReminderUnit.value = unit;
+  defaultTaskReminderValue.value = String(converted);
+  const minutes = converted * reminderFactor(unit);
+  preferences.value.defaultTaskReminder = minutes;
+  lastValidTaskReminderMinutes.value = minutes;
+}
+
+function updateCourseReminderInput(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  if (!/^\d*$/.test(input.value)) {
+    input.value = courseReminderValue.value;
+    return;
+  }
+  courseReminderValue.value = input.value;
+  const value = Number(input.value);
+  if (!input.value || !Number.isInteger(value) || value < 0 || value > 10080) return;
+  preferences.value.courseReminder = value;
+  lastValidCourseReminder.value = value;
+}
+
+function restoreCourseReminderInput(): void {
+  courseReminderValue.value = String(lastValidCourseReminder.value);
+}
+
 function initialAssistantMessages(): AssistantMessage[] {
   return [{
     id: 1,
@@ -509,10 +692,42 @@ function initialAssistantMessages(): AssistantMessage[] {
 function migrateAssistantConversations(conversations: AssistantConversation[]): AssistantConversation[] {
   return conversations.map((conversation) => ({
     ...conversation,
+    tokenUsage: normalizeAssistantTokenUsage(conversation.tokenUsage),
     messages: conversation.messages.map((message, index) => index === 0 && message.role === "assistant" && message.content === LEGACY_ASSISTANT_GREETING
       ? { ...message, content: ASSISTANT_GREETING }
       : message),
   }));
+}
+
+function normalizeAssistantTokenUsage(value: AssistantTokenUsage | undefined): AssistantTokenUsage | undefined {
+  if (!value) return undefined;
+  const inputTokens = Math.max(0, Math.floor(Number(value.inputTokens) || 0));
+  const outputTokens = Math.max(0, Math.floor(Number(value.outputTokens) || 0));
+  const totalTokens = Math.max(inputTokens + outputTokens, Math.floor(Number(value.totalTokens) || 0));
+  return totalTokens ? { inputTokens, outputTokens, totalTokens, ...(value.estimated ? { estimated: true } : {}) } : undefined;
+}
+
+function estimateAssistantTextTokens(value: string): number {
+  return value ? Math.ceil(new TextEncoder().encode(value).length / 3) : 0;
+}
+
+function estimateAssistantMessageTokens(text: string, attachments: AssistantAttachment[]): number {
+  if (!text.trim() && !attachments.length) return 0;
+  return 4 + estimateAssistantTextTokens(text) + attachments.length * ASSISTANT_IMAGE_TOKEN_ESTIMATE;
+}
+
+function estimateAssistantConversationTokens(conversation: AssistantConversation): number {
+  const history = conversation.messages.slice(-30).reduce((total, message) => (
+    total + estimateAssistantMessageTokens(message.content, message.attachments ?? [])
+  ), 0);
+  return ASSISTANT_TOKEN_ESTIMATE_OVERHEAD
+    + estimateAssistantTextTokens(JSON.stringify(assistantTools))
+    + estimateAssistantTextTokens(JSON.stringify(assistantContext()))
+    + history;
+}
+
+function formatTokenCount(value: number): string {
+  return Math.max(0, Math.round(value)).toLocaleString("zh-CN");
 }
 
 function createAssistantConversation(): AssistantConversation {
@@ -533,9 +748,73 @@ function isCampusItemReadable(item: CampusItem): boolean {
 }
 
 function navigate(page: PageId): void {
+  window.scrollTo({ top: 0, behavior: "auto" });
   currentPage.value = page;
+  mobileMoreOpen.value = false;
   location.hash = `/${page}`;
-  window.scrollTo({ top: 0, behavior: "smooth" });
+  void nextTick(() => window.scrollTo({ top: 0, behavior: "auto" }));
+}
+
+function updateSidebarGlider(): void {
+  void nextTick(() => {
+    const sidebar = sidebarRef.value;
+    const target = sidebar?.querySelector<HTMLElement>(`[data-nav-page="${currentPage.value}"]`);
+    if (!sidebar || !target) {
+      sidebarGlider.value = { ...sidebarGlider.value, visible: false };
+      return;
+    }
+    const sidebarBounds = sidebar.getBoundingClientRect();
+    const targetBounds = target.getBoundingClientRect();
+    sidebarGlider.value = {
+      top: targetBounds.top - sidebarBounds.top,
+      height: targetBounds.height,
+      visible: true,
+    };
+    if (!sidebarGliderReady.value) {
+      if (sidebarGliderFrame !== undefined) window.cancelAnimationFrame(sidebarGliderFrame);
+      sidebarGliderFrame = window.requestAnimationFrame(() => {
+        sidebarGliderReady.value = true;
+        sidebarGliderFrame = undefined;
+      });
+    }
+  });
+}
+
+function updateConversationGlider(): void {
+  void nextTick(() => {
+    const list = conversationListRef.value;
+    if (list !== observedConversationList) {
+      conversationGliderResizeObserver?.disconnect();
+      observedConversationList = list;
+      if (list) {
+        conversationGliderResizeObserver = new ResizeObserver(() => updateConversationGlider());
+        conversationGliderResizeObserver.observe(list);
+      }
+    }
+    const target = list
+      ? [...list.querySelectorAll<HTMLElement>("[data-conversation-id]")].find((item) => item.dataset.conversationId === activeConversationId.value)
+      : undefined;
+    if (!list || !target) {
+      conversationGlider.value = { ...conversationGlider.value, visible: false };
+      return;
+    }
+    const listBounds = list.getBoundingClientRect();
+    const targetBounds = target.getBoundingClientRect();
+    conversationGlider.value = {
+      x: targetBounds.left - listBounds.left + list.scrollLeft,
+      y: targetBounds.top - listBounds.top + list.scrollTop,
+      width: targetBounds.width,
+      height: targetBounds.height,
+      visible: true,
+    };
+    if (!conversationGliderReady.value) {
+      if (conversationGliderFrame !== undefined) window.cancelAnimationFrame(conversationGliderFrame);
+      conversationGliderFrame = window.requestAnimationFrame(() => {
+        conversationGliderReady.value = true;
+        conversationGliderFrame = undefined;
+      });
+    }
+  });
 }
 
 function showToast(message: string): void {
@@ -748,8 +1027,11 @@ function resetAllPersonalData(): void {
   notifications.value = [];
   preferences.value = { ...defaultPreferences };
   const reminder = splitReminder(preferences.value.defaultTaskReminder);
-  defaultTaskReminderValue.value = reminder.value;
+  defaultTaskReminderValue.value = String(reminder.value);
   defaultTaskReminderUnit.value = reminder.unit;
+  lastValidTaskReminderMinutes.value = preferences.value.defaultTaskReminder;
+  courseReminderValue.value = String(preferences.value.courseReminder);
+  lastValidCourseReminder.value = preferences.value.courseReminder;
   const conversation = createAssistantConversation();
   assistantConversations.value = [conversation];
   activeConversationId.value = conversation.id;
@@ -869,7 +1151,7 @@ function checkDueCourseReminders(): void {
   const now = Date.now();
   for (const course of courses.value) {
     if (course.reminderMinutes == null || !courseOccursInWeek(course, currentAcademicWeek.value)) continue;
-    const start = addDays(semesterStartDate(), (currentAcademicWeek.value - 1) * 7 + course.weekday - 1);
+    const start = addDays(academicWeekMonday(currentAcademicWeek.value), course.weekday - 1);
     const [hour, minute] = course.startTime.split(":").map(Number);
     start.setHours(hour || 0, minute || 0, 0, 0);
     const remindAt = start.getTime() - course.reminderMinutes * 60_000;
@@ -915,7 +1197,7 @@ function playReminderSound(): void {
     if (context.state === "suspended") void context.resume().then(play).catch(() => undefined);
     else play();
   } catch {
-    // Some browsers require a user gesture before allowing Web Audio.
+    // Some runtimes require a user gesture before allowing Web Audio.
   }
 }
 
@@ -923,7 +1205,7 @@ async function handleBrowserNotificationsChange(): Promise<void> {
   if (!preferences.value.browserNotifications) return;
   if (typeof Notification === "undefined") {
     preferences.value.browserNotifications = false;
-    showToast("当前浏览器不支持 Windows 通知");
+    showToast("当前运行环境不支持 Windows 通知");
     return;
   }
   try {
@@ -1029,7 +1311,7 @@ async function loadImportPreview(): Promise<boolean> {
   }
   importBusy.value = true;
   try {
-    const response = await fetch("/api/courses/class", {
+    const response = await apiFetch("/api/courses/class", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ classId: importClassId.value.trim() }),
@@ -1082,10 +1364,21 @@ function goToCurrentWeek(): void {
 }
 
 function updateSelectedWeek(event: Event): void {
-  const value = Number((event.target as HTMLInputElement).value);
-  if (!Number.isFinite(value)) return;
-  selectedWeek.value = Math.max(1, Math.min(MAX_ACADEMIC_WEEK, Math.trunc(value)));
+  const input = event.target as HTMLInputElement;
+  const rawValue = input.value;
+  const value = Number(rawValue);
+  if (!/^\d+$/.test(rawValue) || !Number.isInteger(value) || value < 1 || value > MAX_ACADEMIC_WEEK) {
+    goToCurrentWeek();
+    input.value = String(selectedWeek.value);
+    return;
+  }
+  selectedWeek.value = value;
+  input.value = String(value);
   pendingCourseSlot.value = null;
+}
+
+function finishSelectedWeekInput(event: KeyboardEvent): void {
+  (event.currentTarget as HTMLInputElement).blur();
 }
 
 function handleScheduleSlotClick(weekday: number, startSection: number): void {
@@ -1150,6 +1443,11 @@ function startCourseEdit(): void {
   courseDeleteConfirming.value = false;
 }
 
+function openCourseDetails(course: Course): void {
+  selectedCourse.value = course;
+  courseEditing.value = false;
+}
+
 function deleteSelectedCourse(): void {
   if (!selectedCourse.value) return;
   if (!courseDeleteConfirming.value) {
@@ -1208,7 +1506,7 @@ async function openCampusItem(item: CampusItem): Promise<void> {
   if (item.kind !== "notice" || item.summary.trim()) return;
   campusSummaryBusy.value = true;
   try {
-    const response = await fetch("/api/campus/summary", {
+    const response = await apiFetch("/api/campus/summary", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: item.id, title: item.title, url: item.url }),
@@ -1247,7 +1545,7 @@ async function queryElectricity(silent = false, dormitoryOverride?: string, thro
   electricityError.value = "";
   try {
     const dormitory = dormitoryOverride?.trim() || electricityDormitory.value;
-    const response = await fetch("/api/electricity/query", {
+    const response = await apiFetch("/api/electricity/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ dormitory }),
@@ -1307,7 +1605,7 @@ async function loadCampusData(): Promise<void> {
   campusBusy.value = true;
   campusError.value = "";
   try {
-    const response = await fetch("/api/campus");
+    const response = await apiFetch("/api/campus");
     const payload = await response.json() as { items?: CampusItem[]; errors?: string[]; statuses?: CampusSourceStatus[]; updatedAt?: string; error?: string };
     campusStatuses.value = payload.statuses ?? [];
     if (!payload.items) throw new Error(payload.error || "校园数据加载失败");
@@ -1334,8 +1632,8 @@ function newAssistantConversation(): void {
     showToast("当前已是空白对话，请先发送一条消息");
     return;
   }
-  const conversation = createAssistantConversation();
-  assistantConversations.value.unshift(conversation);
+  const conversation = assistantConversations.value.find(isAssistantConversationBlank) ?? createAssistantConversation();
+  if (!assistantConversations.value.includes(conversation)) assistantConversations.value.unshift(conversation);
   activeConversationId.value = conversation.id;
   assistantInput.value = "";
   assistantAttachments.value = [];
@@ -1377,6 +1675,16 @@ function resizeAssistantComposer(): void {
   textarea.style.height = "auto";
   textarea.style.height = `${Math.min(160, Math.max(38, textarea.scrollHeight))}px`;
   textarea.style.overflowY = textarea.scrollHeight > 160 ? "auto" : "hidden";
+}
+
+async function scrollAssistantMessages(): Promise<void> {
+  await nextTick();
+  scrollAssistantMessagesImmediately();
+}
+
+function scrollAssistantMessagesImmediately(): void {
+  const panel = assistantChatPanel.value;
+  if (panel) panel.scrollTop = panel.scrollHeight;
 }
 
 function startSidebarResize(event: PointerEvent): void {
@@ -1463,24 +1771,40 @@ function formatReminder(minutes: number | null): string {
 async function sendAssistant(prompt = assistantInput.value): Promise<void> {
   const text = prompt.trim();
   if ((!text && !assistantAttachments.value.length) || assistantBusy.value) return;
-  assistantInput.value = "";
   const attachments = assistantAttachments.value.map((item) => ({ ...item }));
   const conversation = activeConversation.value;
+  const addedTokens = estimateAssistantMessageTokens(text || "请分析这张图片。", attachments);
+  const projectedTokens = assistantContextBaseTokens.value + addedTokens;
+  if (assistantContextThreshold.value > 0 && projectedTokens >= assistantContextThreshold.value) {
+    assistantError.value = "上下文已满，请新建对话后继续";
+    showToast(assistantError.value);
+    return;
+  }
+  assistantInput.value = "";
   const needsGeneratedTitle = conversation.title === "新对话" && !conversation.messages.some((message) => message.role === "user");
   assistantAttachments.value = [];
   assistantMessages.value.push({ id: Date.now(), role: "user", content: text || "请分析这张图片。", createdAt: new Date().toISOString(), ...(attachments.length ? { attachments } : {}) });
+  const previousUsage = normalizeAssistantTokenUsage(conversation.tokenUsage);
+  conversation.tokenUsage = {
+    inputTokens: (previousUsage?.inputTokens ?? assistantContextBaseTokens.value) + addedTokens,
+    outputTokens: previousUsage?.outputTokens ?? 0,
+    totalTokens: projectedTokens,
+    estimated: true,
+  };
   activeConversation.value.updatedAt = new Date().toISOString();
   assistantBusy.value = true;
   assistantError.value = "";
   assistantToolStatus.value = "";
+  void scrollAssistantMessages();
   try {
-    const messageWindow = preferences.value.memoryEnabled ? assistantMessages.value.slice(-12) : assistantMessages.value.slice(-1);
+    const messageWindow = preferences.value.memoryEnabled ? assistantMessages.value.slice(-30) : assistantMessages.value.slice(-1);
     const protocolMessages: Array<Record<string, unknown>> = messageWindow.map(({ role, content, attachments: messageAttachments }) => ({
       role, content, ...(messageAttachments?.length ? { attachments: messageAttachments } : {}),
     }));
     let result: AssistantToolResponse = {};
     for (let round = 0; round < 5; round += 1) {
       result = await requestAssistantCompletion(protocolMessages);
+      if (result.usage) conversation.tokenUsage = normalizeAssistantTokenUsage(result.usage);
       const toolCalls = result.toolCalls ?? [];
       if (!toolCalls.length) break;
       protocolMessages.push({
@@ -1503,12 +1827,24 @@ async function sendAssistant(prompt = assistantInput.value): Promise<void> {
     assistantMode.value = "online";
     if (needsGeneratedTitle) void generateAssistantConversationTitle(conversation);
   } catch (error) {
-    assistantMode.value = "error";
+    if (error instanceof AssistantCompletionError && error.usage) {
+      conversation.tokenUsage = normalizeAssistantTokenUsage(error.usage);
+    }
     assistantError.value = error instanceof Error ? error.message : "AI 服务暂时不可用";
-    assistantMessages.value.push({ id: Date.now() + 1, role: "assistant", content: `暂时无法连接在线 AI：${assistantError.value}。请稍后重试。`, createdAt: new Date().toISOString() });
+    if (assistantError.value.includes("上下文已满")) {
+      assistantMode.value = "unknown";
+      showToast(assistantError.value);
+      return;
+    }
+    assistantMode.value = "error";
+    const failureMessage = `暂时无法连接在线 AI：${assistantError.value}。请稍后重试。`;
+    assistantMessages.value.push({ id: Date.now() + 1, role: "assistant", content: failureMessage, createdAt: new Date().toISOString() });
+    const usage = normalizeAssistantTokenUsage(conversation.tokenUsage);
+    if (usage) conversation.tokenUsage = { ...usage, totalTokens: usage.totalTokens + estimateAssistantTextTokens(failureMessage), estimated: true };
   } finally {
     assistantToolStatus.value = "";
     assistantBusy.value = false;
+    void scrollAssistantMessages();
   }
 }
 
@@ -1537,7 +1873,7 @@ function assistantContext(): Record<string, unknown> {
 }
 
 async function requestAssistantCompletion(messages: Array<Record<string, unknown>>): Promise<AssistantToolResponse> {
-  const response = await fetch("/api/assistant/chat", {
+  const response = await apiFetch("/api/assistant/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1549,7 +1885,7 @@ async function requestAssistantCompletion(messages: Array<Record<string, unknown
     }),
   });
   const payload = await response.json() as AssistantToolResponse;
-  if (!response.ok) throw new Error(payload.error || "AI 服务暂时不可用");
+  if (!response.ok) throw new AssistantCompletionError(payload.error || "AI 服务暂时不可用", payload.usage);
   return payload;
 }
 
@@ -1708,7 +2044,7 @@ function parseAssistantDeadline(value: string): string | null {
 
 async function generateAssistantConversationTitle(conversation: AssistantConversation): Promise<void> {
   try {
-    const response = await fetch("/api/assistant/title", {
+    const response = await apiFetch("/api/assistant/title", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1744,33 +2080,101 @@ function runAssistantAction(message: AssistantMessage): void {
     showToast("任务已由助手添加");
   }
 }
+
+async function logoutAccount(): Promise<void> {
+  if (accountLogoutBusy.value) return;
+  accountLogoutBusy.value = true;
+  try {
+    await logoutSession();
+  } finally {
+    try {
+      await clearSavedLogin();
+    } catch {
+      // The server session is already closed; continue to the login screen even if local cleanup fails.
+    }
+    sessionStorage.removeItem("youxueban-auth-user");
+    window.location.reload();
+  }
+}
+
+async function changePassword(): Promise<void> {
+  if (passwordChangeBusy.value) return;
+  passwordChangeError.value = "";
+  const { currentPassword, newPassword, confirmPassword } = passwordChangeForm.value;
+  if (currentPassword.length < 6) {
+    passwordChangeError.value = "请输入原密码。";
+    return;
+  }
+  if (newPassword.length < 6 || newPassword.length > 128) {
+    passwordChangeError.value = "新密码长度应为 6 到 128 个字符。";
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    passwordChangeError.value = "两次输入的新密码不一致。";
+    return;
+  }
+  if (newPassword === currentPassword) {
+    passwordChangeError.value = "新密码不能与原密码相同。";
+    return;
+  }
+  passwordChangeBusy.value = true;
+  try {
+    const response = await apiFetch("/api/v1/auth/password", {
+      method: "POST",
+      body: JSON.stringify({ currentPassword, newPassword, confirmPassword }),
+    });
+    const payload = await response.json().catch(() => ({})) as { error?: string };
+    if (!response.ok) {
+      passwordChangeError.value = payload.error || "修改密码失败，请稍后重试。";
+      return;
+    }
+    passwordChangeOpen.value = false;
+    passwordChangeForm.value = { currentPassword: "", newPassword: "", confirmPassword: "" };
+    setAccessToken("");
+    try {
+      await clearSavedLogin();
+    } catch {
+      // The server session is already invalidated; continue to the login screen.
+    }
+    sessionStorage.removeItem("youxueban-auth-user");
+    window.location.reload();
+  } catch {
+    passwordChangeError.value = "无法连接邮学伴服务端，请稍后重试。";
+  } finally {
+    passwordChangeBusy.value = false;
+  }
+}
 </script>
 
 <template>
   <div class="app-shell" :style="{ '--sidebar-width': `${sidebarWidth}px` }">
-    <aside class="sidebar">
+    <aside ref="sidebarRef" class="sidebar">
+      <span class="sidebar-nav-glider" :class="{ ready: sidebarGliderReady }" :style="sidebarGliderStyle" aria-hidden="true" />
       <button class="brand" type="button" aria-label="返回今天" @click="navigate('today')">
         <span class="brand-mark">邮</span>
         <span><strong>邮学伴</strong><small>北邮人的学习与生活助手</small></span>
       </button>
       <nav class="side-nav" aria-label="主导航">
-        <button v-for="item in navItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" @click="navigate(item.id)">
+        <button v-for="item in navItems" :key="item.id" type="button" :data-nav-page="item.id" :class="{ active: currentPage === item.id }" :aria-current="currentPage === item.id ? 'page' : undefined" @click="navigate(item.id)">
           <IconGlyph :name="item.icon" /> <span>{{ item.label }}</span>
         </button>
       </nav>
       <div class="sidebar-spacer" />
-      <div class="profile-button sidebar-profile"><span class="avatar"><img v-if="profileAvatar" :src="profileAvatar" alt="" /><template v-else>{{ profileInitial }}</template></span><span class="profile-text">{{ profileName }}<small>北邮学生</small></span></div>
-      <button class="sidebar-status" type="button" @click="navigate('notifications')">
-        <span class="status-dot" /><span><strong>提醒</strong><small>{{ unreadCount }} 条未读通知</small></span>
-      </button>
-      <button class="sidebar-settings" type="button" :class="{ active: currentPage === 'settings' }" @click="navigate('settings')"><IconGlyph name="settings" />设置</button>
+      <div class="sidebar-footer">
+        <div class="profile-button sidebar-profile"><span class="avatar"><img v-if="profileAvatar" :src="profileAvatar" alt="" /><template v-else>{{ profileInitial }}</template></span><span class="profile-text">{{ profileName }}<small>北邮学生</small></span></div>
+        <div class="sidebar-footer-actions">
+          <button class="sidebar-status" type="button" :class="{ active: currentPage === 'notifications' }" :aria-current="currentPage === 'notifications' ? 'page' : undefined" @click="navigate('notifications')"><IconGlyph name="bell" /><span><strong>消息</strong><small>{{ unreadCount ? `${unreadCount} 条未读` : '暂无未读' }}</small></span></button>
+          <button class="sidebar-settings" type="button" :class="{ active: currentPage === 'settings' }" :aria-current="currentPage === 'settings' ? 'page' : undefined" @click="navigate('settings')"><IconGlyph name="settings" /><span>设置</span></button>
+        </div>
+      </div>
       <button class="sidebar-resizer" type="button" role="separator" aria-orientation="vertical" aria-label="调节左侧菜单栏宽度" :aria-valuenow="sidebarWidth" aria-valuemin="190" aria-valuemax="320" @pointerdown="startSidebarResize" @keydown="resizeSidebarWithKeyboard" />
     </aside>
 
     <div class="app-main">
       <main class="page-container">
+        <Transition name="page-view" mode="out-in" appear>
         <section v-if="currentPage === 'today'" class="page page-today">
-          <header class="page-heading today-heading"><div><span class="eyebrow">第 {{ currentAcademicWeek }} 周</span><h1>{{ greeting }}，{{ profileName || '同学' }}。</h1><p>先把今天的安排理清楚。</p></div><time class="today-clock"><strong>{{ timeHeading }}</strong><span>{{ dateHeading }}</span></time></header>
+          <header class="page-heading today-heading"><div><span class="eyebrow">BUPT · 第 {{ currentAcademicWeek }} 周</span><h1>{{ greeting }}，{{ profileName || '同学' }}。</h1><p>把课程、任务和校园消息，收进今天的节奏里。</p></div><time class="today-clock"><strong>{{ timeHeading }}</strong><span>{{ dateHeading }}</span></time></header>
           <div class="today-layout">
             <div class="content-stack">
               <article class="surface course-overview">
@@ -1783,7 +2187,7 @@ function runAssistantAction(message: AssistantMessage): void {
                 <div v-else class="empty-state compact"><IconGlyph name="courses" /><strong>今天没有后续课程</strong><span>可以继续处理任务或安排复习。</span></div>
                 <div class="day-timeline">
                   <div v-for="course in todayCourses" :key="course.id" class="timeline-row">
-                    <time>{{ course.startTime }}</time><span class="timeline-line" /><button type="button" @click="selectedCourse = course"><strong>{{ course.name }}</strong><small>{{ course.location }} · {{ course.endTime }} 下课</small></button>
+                    <time>{{ course.startTime }}</time><span class="timeline-line" /><button type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><small>{{ course.location }} · {{ course.endTime }} 下课</small></button>
                   </div>
                 </div>
               </article>
@@ -1825,7 +2229,7 @@ function runAssistantAction(message: AssistantMessage): void {
         </section>
 
         <section v-else-if="currentPage === 'courses'" class="page">
-          <header class="page-heading split"><div><span class="eyebrow">当前是第 {{ currentAcademicWeek }} 周</span><h1 v-if="selectedWeek === currentAcademicWeek">本周课程</h1><h1 v-else>第 <input class="week-number-input" type="number" min="1" :max="MAX_ACADEMIC_WEEK" :value="selectedWeek" aria-label="查看第几周课程" @input="updateSelectedWeek" /> 周课程</h1><p>点击课程查看周次、地点、教师和提醒设置。</p></div><button class="primary-button" type="button" @click="openImport"><IconGlyph name="upload" />导入课表</button></header>
+          <header class="page-heading split"><div><span class="eyebrow">当前是第 {{ currentAcademicWeek }} 周</span><h1>第 <input class="week-number-input" type="text" inputmode="numeric" pattern="[0-9]*" :value="selectedWeek" aria-label="查看第几周课程" @blur="updateSelectedWeek" @keydown.enter.prevent="finishSelectedWeekInput" /> 周课程</h1><p>点击课程查看周次、地点、教师和提醒设置。</p></div><button class="primary-button" type="button" @click="openImport"><IconGlyph name="upload" />导入课表</button></header>
           <div class="toolbar course-toolbar"><div class="week-switcher"><button class="icon-button" type="button" aria-label="上一周" :disabled="selectedWeek <= 1" @click="changeWeek(-1)"><IconGlyph name="chevron-left" /></button><button class="secondary-button active week-current-button" type="button" @click="goToCurrentWeek">{{ selectedWeek === currentAcademicWeek ? '本周' : `返回第 ${currentAcademicWeek} 周` }}</button><button class="icon-button" type="button" aria-label="下一周" :disabled="selectedWeek >= MAX_ACADEMIC_WEEK" @click="changeWeek(1)"><IconGlyph name="chevron-right" /></button></div><span class="sync-status"><span class="status-dot" />第 {{ selectedWeek }} 周</span></div>
           <div class="schedule-wrap surface">
             <div class="schedule-grid">
@@ -1834,10 +2238,10 @@ function runAssistantAction(message: AssistantMessage): void {
                 <div class="section-label" :style="{ gridColumn: '1', gridRow: String(row.key + 1) }"><strong>{{ row.label }}</strong><span>{{ row.startTime }}</span><span>{{ row.endTime }}</span></div>
                 <button v-for="day in 7" :key="`${row.key}-${day}`" class="schedule-slot" :class="{ selected: pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key }" :style="{ gridColumn: String(day + 1), gridRow: String(row.key + 1) }" type="button" :aria-label="`${weekdays[day - 1]}第${row.key}节空白课程区域`" @click="handleScheduleSlotClick(day, row.key)"><IconGlyph v-if="pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key" name="plus" :size="18" /></button>
               </template>
-              <button v-for="course in visibleCourses" :key="course.id" class="course-cell" :class="[`course-${course.color}`, { compact: course.endSection === course.startSection }]" :style="courseGridPosition(course)" type="button" @click="selectedCourse = course; courseEditing = false"><strong>{{ course.name }}</strong><span>{{ course.location }}</span><small>{{ course.teacher }}</small></button>
+              <button v-for="course in visibleCourses" :key="course.id" class="course-cell" :class="[`course-${course.color}`, { compact: course.endSection === course.startSection }]" :style="courseGridPosition(course)" type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><span>{{ course.location }}</span><small>{{ course.teacher }}</small></button>
             </div>
           </div>
-          <div class="mobile-course-list surface"><article v-for="course in visibleCourses" :key="course.id"><time>{{ weekdays[course.weekday - 1] ?? `周${course.weekday}` }}<br>{{ formatWeekDate(weekDates[course.weekday - 1]!.date) }} · {{ course.startTime }}–{{ course.endTime }}</time><span :class="`course-marker course-${course.color}`" /><button type="button" @click="selectedCourse = course; courseEditing = false"><strong>{{ course.name }}</strong><small>第 {{ course.startSection }}–{{ course.endSection }} 节 · {{ course.location }} · {{ course.teacher }}</small></button></article><div v-if="!visibleCourses.length" class="empty-state compact"><strong>这一周没有课程</strong><span>仍可使用上方按钮继续切换周次，或导入你的真实课表。</span></div></div>
+          <div class="mobile-course-list surface"><article v-for="course in visibleCourses" :key="course.id"><time>{{ weekdays[course.weekday - 1] ?? `周${course.weekday}` }}<br>{{ formatWeekDate(weekDates[course.weekday - 1]!.date) }} · {{ course.startTime }}–{{ course.endTime }}</time><span :class="`course-marker course-${course.color}`" /><button type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><small>第 {{ course.startSection }}–{{ course.endSection }} 节 · {{ course.location }} · {{ course.teacher }}</small></button></article><div v-if="!visibleCourses.length" class="empty-state compact"><strong>这一周没有课程</strong><span>仍可使用上方按钮继续切换周次，或导入你的真实课表。</span></div></div>
         </section>
 
         <section v-else-if="currentPage === 'campus'" class="page">
@@ -1874,22 +2278,26 @@ function runAssistantAction(message: AssistantMessage): void {
         </section>
 
         <section v-else-if="currentPage === 'assistant'" class="page assistant-page">
-          <header class="page-heading"><span class="eyebrow">{{ assistantMode === 'online' ? '在线 AI' : assistantMode === 'error' ? '连接失败' : '学习问答' }}</span><h1>学习助手</h1><p>提问课程知识、上传题目图片，或让助手结合课表和任务规划学习。</p><div v-if="assistantRuntime" class="assistant-runtime" aria-label="当前助手配置"><span><small>模型</small><strong>{{ assistantModelLabel }}</strong></span><span v-if="assistantRuntime.thinkingSupported"><small>思考</small><strong>{{ assistantThinkingEnabled ? '已开启' : '已关闭' }}</strong></span><span v-if="assistantRuntime.webSearchEnabled !== undefined"><small>联网搜索</small><strong>{{ assistantRuntime.webSearchEnabled ? '已开启' : '已关闭' }}</strong></span></div></header>
+          <header class="page-heading"><span class="eyebrow">{{ assistantMode === 'online' ? '在线 AI' : assistantMode === 'error' ? '连接失败' : '学习问答' }}</span><h1>学习助手</h1><p>提问课程知识、上传题目图片，或让助手结合课表和任务规划学习。</p><div v-if="assistantRuntime" class="assistant-runtime" aria-label="当前助手配置"><span><small>模型</small><strong>{{ assistantModelLabel }}</strong></span><span v-if="assistantRuntime.thinkingSupported"><small>思考</small><strong>{{ assistantThinkingEnabled ? '已开启' : '已关闭' }}</strong></span><span v-if="assistantRuntime.webSearchEnabled !== undefined"><small>联网搜索</small><strong>{{ assistantRuntime.webSearchEnabled ? '已开启' : '已关闭' }}</strong></span><span v-if="assistantRuntime.contextWindow" class="token-usage" :class="{ warning: assistantContextNearLimit, full: assistantContextBlocked }"><small>上下文</small><strong>{{ assistantTokenLabel }}</strong><span class="token-meter" role="progressbar" aria-label="上下文 token 使用量" :aria-valuenow="assistantContextTokens" aria-valuemin="0" :aria-valuemax="assistantRuntime.contextWindow"><i :style="{ width: `${assistantContextPercent}%` }" /></span></span></div></header>
           <div class="assistant-workspace">
             <div class="assistant-chat-column">
-              <div class="quick-prompts"><button v-for="prompt in ['解释这道题的思路','我今天有什么课？','列出三天内的 DDL','帮我制定复习计划']" :key="prompt" type="button" @click="sendAssistant(prompt)">{{ prompt }}</button></div>
-              <div class="chat-panel surface" aria-live="polite">
-                <div v-for="message in assistantMessages" :key="message.id" class="message" :class="message.role">
-                  <span class="message-avatar"><template v-if="message.role === 'assistant'">邮</template><img v-else-if="profileAvatar" :src="profileAvatar" alt="" /><template v-else>{{ profileInitial }}</template></span>
-                  <div class="message-content"><div v-if="message.attachments?.length" class="message-attachments"><img v-for="attachment in message.attachments" :key="attachment.id" :src="attachment.dataUrl" :alt="attachment.name" /></div><div v-if="message.role === 'assistant'" class="markdown-body" v-html="renderAssistantContent(message.content)" /><p v-else>{{ message.content }}</p><button v-if="message.action" class="inline-action" :disabled="message.action.completed" type="button" @click="runAssistantAction(message)"><IconGlyph :name="message.action.completed ? 'check' : 'arrow-right'" :size="15" />{{ message.action.completed ? '已完成' : message.action.label }}</button></div>
-                </div>
-                <div v-if="assistantBusy && assistantMessages[assistantMessages.length - 1]?.role !== 'assistant'" class="message assistant"><span class="message-avatar">邮</span><div class="message-content typing"><span /><span /><span /><small v-if="assistantToolStatus">{{ assistantToolStatus }}</small></div></div>
+              <div class="quick-prompts"><button v-for="prompt in ['解释这道题的思路','我今天有什么课？','列出三天内的 DDL','帮我制定复习计划']" :key="prompt" type="button" :disabled="assistantBusy || assistantContextBlocked" @click="sendAssistant(prompt)">{{ prompt }}</button></div>
+              <div ref="assistantChatPanel" class="chat-panel surface" aria-label="对话记录" aria-live="polite" tabindex="0">
+                <Transition name="conversation-content" mode="out-in" @enter="scrollAssistantMessagesImmediately">
+                  <div :key="activeConversationId" class="conversation-content">
+                    <div v-for="message in assistantMessages" :key="message.id" class="message" :class="message.role">
+                      <span class="message-avatar"><template v-if="message.role === 'assistant'">邮</template><img v-else-if="profileAvatar" :src="profileAvatar" alt="" /><template v-else>{{ profileInitial }}</template></span>
+                      <div class="message-content"><div v-if="message.attachments?.length" class="message-attachments"><img v-for="attachment in message.attachments" :key="attachment.id" :src="attachment.dataUrl" :alt="attachment.name" /></div><div v-if="message.role === 'assistant'" class="markdown-body" v-html="renderAssistantContent(message.content)" /><p v-else>{{ message.content }}</p><button v-if="message.action" class="inline-action" :disabled="message.action.completed" type="button" @click="runAssistantAction(message)"><IconGlyph :name="message.action.completed ? 'check' : 'arrow-right'" :size="15" />{{ message.action.completed ? '已完成' : message.action.label }}</button></div>
+                    </div>
+                    <div v-if="assistantBusy && assistantMessages[assistantMessages.length - 1]?.role !== 'assistant'" class="message assistant"><span class="message-avatar">邮</span><div class="message-content typing"><span /><span /><span /><small v-if="assistantToolStatus">{{ assistantToolStatus }}</small></div></div>
+                  </div>
+                </Transition>
               </div>
               <div v-if="assistantAttachments.length" class="assistant-attachment-tray"><span v-for="attachment in assistantAttachments" :key="attachment.id"><img :src="attachment.dataUrl" :alt="attachment.name" /><small>{{ attachment.name }}</small><button type="button" aria-label="移除附件" @click="removeAssistantAttachment(attachment.id)"><IconGlyph name="close" :size="13" /></button></span></div>
-              <form class="assistant-composer" @submit.prevent="sendAssistant()"><input ref="assistantFileInput" type="file" hidden multiple :accept="assistantRuntime?.allowedFileTypes?.join(',')" @change="selectAssistantFiles" /><button class="composer-tool" type="button" :disabled="!assistantRuntime?.allowedFileTypes?.length" aria-label="上传图片" title="上传当前模型支持的图片" @click="openAssistantFilePicker"><IconGlyph name="plus" /></button><textarea ref="assistantTextarea" v-model="assistantInput" rows="1" placeholder="给学习助手发送信息" @input="resizeAssistantComposer" @keydown.enter.exact.prevent="sendAssistant()" /><button v-if="assistantRuntime?.thinkingSupported" class="thinking-toggle" :class="{ active: assistantThinkingEnabled }" type="button" :aria-pressed="assistantThinkingEnabled" @click="assistantThinkingEnabled = !assistantThinkingEnabled"><IconGlyph name="assistant" :size="16" /><span>{{ assistantThinkingEnabled ? '思考' : '快速' }}</span></button><button class="composer-send" type="submit" :disabled="assistantBusy || (!assistantInput.trim() && !assistantAttachments.length)" aria-label="发送"><IconGlyph name="send" /></button></form>
-              <p class="assistant-note">{{ assistantMode === 'error' ? `在线 AI 暂不可用：${assistantError}` : '支持 PNG、JPG、WebP 图片；回答仅供学习参考，请自行核对关键结论。' }}</p>
+              <form class="assistant-composer" :class="{ blocked: assistantContextBlocked }" @submit.prevent="sendAssistant()"><input ref="assistantFileInput" type="file" hidden multiple :accept="assistantRuntime?.allowedFileTypes?.join(',')" @change="selectAssistantFiles" /><button class="composer-tool" type="button" :disabled="assistantContextBlocked || !assistantRuntime?.allowedFileTypes?.length" aria-label="上传图片" title="上传当前模型支持的图片" @click="openAssistantFilePicker"><IconGlyph name="plus" /></button><textarea ref="assistantTextarea" v-model="assistantInput" rows="1" :placeholder="assistantContextBlocked ? '上下文已满，请新建对话后继续' : '给学习助手发送信息'" aria-describedby="assistant-context-note" @input="resizeAssistantComposer" @keydown.enter.exact.prevent="sendAssistant()" /><button v-if="assistantRuntime?.thinkingSupported" class="thinking-toggle" :class="{ active: assistantThinkingEnabled }" type="button" :aria-pressed="assistantThinkingEnabled" @click="assistantThinkingEnabled = !assistantThinkingEnabled"><IconGlyph name="assistant" :size="16" /><span>{{ assistantThinkingEnabled ? '思考' : '快速' }}</span></button><button class="composer-send" type="submit" :disabled="assistantBusy || assistantContextBlocked || (!assistantInput.trim() && !assistantAttachments.length)" :aria-label="assistantContextBlocked ? '上下文已满，无法发送' : '发送'"><IconGlyph name="send" /></button></form>
+              <p id="assistant-context-note" class="assistant-note" :class="{ warning: assistantContextNearLimit, full: assistantContextBlocked }" :role="assistantContextBlocked ? 'alert' : undefined">{{ assistantContextBlocked ? '上下文已满，已停止发送。请新建对话后继续。' : assistantContextNearLimit ? `上下文已使用 ${assistantContextPercent}%，接近上限。` : assistantMode === 'error' ? `在线 AI 暂不可用：${assistantError}` : '支持 PNG、JPG、WebP 图片；回答仅供学习参考，请自行核对关键结论。' }}</p>
             </div>
-            <aside class="conversation-sidebar surface"><header><strong>对话</strong><button class="icon-button" type="button" :disabled="activeConversationIsBlank" :aria-label="activeConversationIsBlank ? '当前已是空白对话' : '新建对话'" @click="newAssistantConversation"><IconGlyph name="plus" /></button></header><div><div v-for="conversation in assistantConversations" :key="conversation.id" class="conversation-item" :class="{ active: conversation.id === activeConversationId }"><button class="conversation-select" type="button" @click="selectAssistantConversation(conversation.id)"><strong>{{ conversation.title }}</strong><small>{{ formatDateTime(conversation.updatedAt) }}</small></button><button class="conversation-delete" :class="{ confirming: assistantDeleteConfirmId === conversation.id }" type="button" :aria-label="assistantDeleteConfirmId === conversation.id ? '确认删除对话' : '删除对话'" @click="deleteAssistantConversation(conversation.id)"><span v-if="assistantDeleteConfirmId === conversation.id">确认删除</span><IconGlyph v-else name="trash" :size="14" /></button></div></div></aside>
+            <aside class="conversation-sidebar surface"><header><strong>对话</strong><button class="icon-button" type="button" :disabled="activeConversationIsBlank" :aria-label="activeConversationIsBlank ? '当前已是空白对话' : '新建对话'" @click="newAssistantConversation"><IconGlyph name="plus" /></button></header><div ref="conversationListRef" class="conversation-list"><span class="conversation-glider" :class="{ ready: conversationGliderReady }" :style="conversationGliderStyle" aria-hidden="true" /><div v-for="conversation in listedAssistantConversations" :key="conversation.id" class="conversation-item" :class="{ active: conversation.id === activeConversationId }" :data-conversation-id="conversation.id"><button class="conversation-select" type="button" @click="selectAssistantConversation(conversation.id)"><strong>{{ conversation.title }}</strong><small>{{ formatDateTime(conversation.updatedAt) }}</small></button><button class="conversation-delete" :class="{ confirming: assistantDeleteConfirmId === conversation.id }" type="button" :aria-label="assistantDeleteConfirmId === conversation.id ? '确认删除对话' : '删除对话'" @click="deleteAssistantConversation(conversation.id)"><span v-if="assistantDeleteConfirmId === conversation.id">确认删除</span><IconGlyph v-else name="trash" :size="14" /></button></div></div></aside>
           </div>
         </section>
 
@@ -1900,19 +2308,30 @@ function runAssistantAction(message: AssistantMessage): void {
 
         <section v-else class="page narrow-page settings-page">
           <header class="page-heading"><span class="eyebrow">个人偏好</span><h1>设置</h1><p>管理提醒、显示和隐私，不需要修改配置文件。</p></header>
-          <article class="settings-section surface profile-settings"><div><h2>个人资料</h2><p>昵称会用于问候；头像可从本地上传，图片只保存在当前浏览器。</p></div><div class="profile-editor"><span class="avatar avatar-preview"><img v-if="profileDraftAvatar" :src="profileDraftAvatar" alt="头像预览" /><template v-else>{{ profileDraftName.trim().slice(0, 1) || '邮' }}</template></span><div class="profile-fields"><label>昵称<input v-model="profileDraftName" maxlength="20" placeholder="该怎么称呼你" @input="profileEditError = ''" /></label><div class="avatar-upload-actions"><label class="secondary-button file-button"><IconGlyph name="upload" :size="16" />上传头像<input type="file" accept="image/png,image/jpeg,image/webp" @change="selectAvatarFile" /></label><button v-if="profileDraftAvatar" class="text-button" type="button" @click="clearAvatarDraft">移除头像</button><small>PNG、JPG 或 WebP，不超过 2 MB</small></div><p v-if="profileEditError" class="inline-error" role="alert">{{ profileEditError }}</p></div><button class="secondary-button" type="button" @click="saveProfile">保存资料</button></div></article>
-          <article class="settings-section surface"><div><h2>外观</h2><p>选择适合当前设备的显示模式。</p></div><div class="segmented"><button v-for="option in [{id:'system',label:'跟随系统'},{id:'light',label:'浅色'},{id:'dark',label:'深色'}]" :key="option.id" type="button" :class="{ active: preferences.theme === option.id }" @click="preferences.theme = option.id as Preferences['theme']">{{ option.label }}</button></div></article>
-          <article class="settings-section surface"><div><h2>默认提醒</h2><p>任务可选择分钟、小时或天；0 表示到点提醒，最长提前 7 天。</p></div><label>任务提前<div class="reminder-control"><input v-model.number="defaultTaskReminderValue" type="number" min="0" :max="defaultTaskReminderUnit === 'days' ? 7 : defaultTaskReminderUnit === 'hours' ? 168 : 10080" step="1" /><select v-model="defaultTaskReminderUnit" aria-label="任务提醒单位"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input v-model.number="preferences.courseReminder" type="number" min="0" max="10080" step="1" /><span>分钟</span></div></label></article>
-          <article class="settings-section surface course-settings"><div><h2>课程表</h2><p>清空当前课表中的全部课程，操作需要再次点击确认。</p></div><button class="danger-button" :class="{ confirming: courseClearConfirming }" type="button" @click="clearCourses">{{ courseClearConfirming ? '再次点击确认清空' : '清空课表' }}</button></article>
-          <article class="settings-section surface"><div><h2>学期课表</h2><p>第 1 周周一，用于计算周次和每天的日期。</p></div><label>学期开始<input v-model="preferences.semesterStart" type="date" /></label></article>
+          <article class="settings-section surface profile-settings"><div><h2>个人资料</h2><p>昵称会用于问候；头像可从本地上传，图片只保存在当前设备。</p></div><div class="profile-editor"><span class="avatar avatar-preview"><img v-if="profileDraftAvatar" :src="profileDraftAvatar" alt="头像预览" /><template v-else>{{ profileDraftName.trim().slice(0, 1) || '邮' }}</template></span><div class="profile-fields"><label>昵称<input v-model="profileDraftName" maxlength="20" placeholder="该怎么称呼你" @input="profileEditError = ''" /></label><div class="avatar-upload-actions"><label class="secondary-button file-button"><IconGlyph name="upload" :size="16" />上传头像<input type="file" accept="image/png,image/jpeg,image/webp" @change="selectAvatarFile" /></label><button v-if="profileDraftAvatar" class="text-button" type="button" @click="clearAvatarDraft">移除头像</button><small>PNG、JPG 或 WebP，不超过 2 MB</small></div><p v-if="profileEditError" class="inline-error" role="alert">{{ profileEditError }}</p></div><button class="secondary-button" type="button" @click="saveProfile">保存资料</button></div></article>
+          <article class="settings-section surface appearance-settings"><div><h2>外观与动效</h2><p>选择显示模式，并按需要降低界面动态效果。</p></div><div class="appearance-controls"><div class="segmented"><button v-for="option in [{id:'system',label:'跟随系统'},{id:'light',label:'浅色'},{id:'dark',label:'深色'}]" :key="option.id" type="button" :class="{ active: preferences.theme === option.id }" @click="preferences.theme = option.id as Preferences['theme']">{{ option.label }}</button></div><label class="switch-row motion-setting"><span><strong>减少动画效果</strong><small>关闭菜单滑动和页面淡入淡出，适合对动态效果敏感时使用</small></span><input v-model="preferences.reduceMotion" type="checkbox" role="switch" aria-label="减少动画效果" /></label></div></article>
+          <article class="settings-section surface"><div><h2>默认提醒</h2><p>任务可选择分钟、小时或天；切换单位时自动换算。仅允许整数，非法输入会恢复上次有效设置。</p></div><label>任务提前<div class="reminder-control"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="defaultTaskReminderValue" @input="updateDefaultTaskReminderInput" @blur="restoreDefaultTaskReminderInput" /><select :value="defaultTaskReminderUnit" aria-label="任务提醒单位" @change="changeDefaultTaskReminderUnit"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="courseReminderValue" @input="updateCourseReminderInput" @blur="restoreCourseReminderInput" /><span>分钟</span></div></label></article>
+          <article class="settings-section surface notification-settings"><div><h2>桌面通知</h2><p>控制课程和任务到期时的系统提醒，不属于隐私授权。</p></div><label class="switch-row"><span><strong>允许系统通知</strong><small>提醒时播放声音，并在应用运行时显示 Windows 系统通知</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="桌面通知" @change="handleBrowserNotificationsChange" /></label></article>
+          <article class="settings-section surface"><div><h2>学期课表</h2><p>第 1 周起始日，用于计算周次；周课表仍按周一至周日排列。</p></div><label>第一周开始<input v-model="preferences.semesterStart" type="date" /></label></article>
           <article class="settings-section surface"><div><h2>静默时段</h2><p>默认不弹出提醒；只有任务中勾选“静默时段仍提醒”的事项例外。</p></div><label>开始<input v-model="preferences.quietStart" type="time" /></label><label>结束<input v-model="preferences.quietEnd" type="time" /></label></article>
-          <article class="settings-section surface privacy-settings"><div><h2>隐私</h2><p>控制助手如何使用你的数据。</p></div><div class="switch-row"><span><strong>浏览器通知</strong><small>提醒时播放声音，并在页面打开时显示 Windows 系统通知</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="浏览器通知" @change="handleBrowserNotificationsChange" /></div><div class="switch-row"><span><strong>个性化记忆</strong><small>允许助手参考当前对话的历史消息与称呼</small></span><input v-model="preferences.memoryEnabled" type="checkbox" role="switch" aria-label="个性化记忆" /></div><div class="switch-row"><span><strong>学习数据分析</strong><small>允许助手和“现在做什么”分析本地课程、任务与学习节奏</small></span><input v-model="preferences.analyticsEnabled" type="checkbox" role="switch" aria-label="学习数据分析" /></div></article>
-          <article class="settings-section surface danger-zone"><div><h2>重置个人信息</h2><p>清除本浏览器中的昵称、头像、任务、课表、设置、已读与订阅状态。</p></div><button class="danger-button" :class="{ confirming: resetConfirming }" type="button" @click="resetAllPersonalData">{{ resetConfirming ? '确认永久重置' : '重置所有个人信息' }}</button></article>
+          <article class="settings-section surface account-settings"><div><h2>账号</h2><p>修改密码后，所有设备上的登录会话都会失效，需要使用新密码重新登录。</p></div><div class="account-actions"><button class="secondary-button" type="button" :disabled="passwordChangeBusy" @click="passwordChangeError = ''; passwordChangeOpen = true">修改密码</button><button class="secondary-button" type="button" :disabled="accountLogoutBusy" @click="accountLogoutConfirmOpen = true">退出账号</button></div></article>
+          <article class="settings-section surface privacy-settings"><div><h2>隐私</h2><p>控制助手如何使用你的数据。</p></div><div class="switch-row"><span><strong>个性化记忆</strong><small>允许助手参考当前对话的历史消息与称呼</small></span><input v-model="preferences.memoryEnabled" type="checkbox" role="switch" aria-label="个性化记忆" /></div><div class="switch-row"><span><strong>学习数据分析</strong><small>允许助手分析本地课程、任务与学习节奏</small></span><input v-model="preferences.analyticsEnabled" type="checkbox" role="switch" aria-label="学习数据分析" /></div></article>
+          <section class="danger-section" aria-labelledby="danger-section-title"><header><span class="eyebrow">请谨慎操作</span><h2 id="danger-section-title">危险区</h2><p>以下操作会清除本机数据，执行前均需要再次确认。</p></header><div class="danger-actions"><article class="danger-zone surface"><div><h3>清空课程表</h3><p>删除当前课表中的全部课程，不影响任务和其他个人设置。</p></div><button class="danger-button" :class="{ confirming: courseClearConfirming }" type="button" @click="clearCourses">{{ courseClearConfirming ? '再次点击确认清空' : '清空课表' }}</button></article><article class="danger-zone surface"><div><h3>重置个人信息</h3><p>清除当前设备中的昵称、头像、任务、课表、设置、已读与订阅状态。</p></div><button class="danger-button" :class="{ confirming: resetConfirming }" type="button" @click="resetAllPersonalData">{{ resetConfirming ? '确认永久重置' : '重置所有个人信息' }}</button></article></div></section>
         </section>
+        </Transition>
       </main>
     </div>
 
-    <nav class="mobile-nav" aria-label="移动端主导航"><button v-for="item in navItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" @click="navigate(item.id)"><IconGlyph :name="item.icon" /><span>{{ item.label }}</span></button><button type="button" :class="{ active: currentPage === 'notifications' }" @click="navigate('notifications')"><IconGlyph name="bell" /><span>通知</span></button><button type="button" :class="{ active: currentPage === 'settings' }" @click="navigate('settings')"><IconGlyph name="settings" /><span>设置</span></button></nav>
+    <nav class="mobile-nav" aria-label="移动端主导航"><button v-for="item in mobilePrimaryNavItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" @click="navigate(item.id)"><IconGlyph :name="item.icon" /><span>{{ item.label }}</span></button><button type="button" :class="{ active: mobileMoreOpen || mobileMoreNavItems.some((item) => item.id === currentPage) }" aria-haspopup="dialog" :aria-expanded="mobileMoreOpen" @click="mobileMoreOpen = !mobileMoreOpen"><IconGlyph name="more" /><span>更多</span></button></nav>
+
+    <Transition name="mobile-menu">
+      <div v-if="mobileMoreOpen" class="mobile-more-backdrop" @click.self="mobileMoreOpen = false">
+        <section class="mobile-more-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-more-title">
+          <header><div><span class="eyebrow">邮学伴</span><h2 id="mobile-more-title">更多校园服务</h2></div><button class="icon-button" type="button" aria-label="关闭更多服务" @click="mobileMoreOpen = false"><IconGlyph name="close" /></button></header>
+          <div class="mobile-more-grid"><button v-for="item in mobileMoreNavItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" @click="navigate(item.id)"><span class="mobile-more-icon"><IconGlyph :name="item.icon" /></span><span><strong>{{ item.label }}</strong><small>{{ item.description }}</small></span><IconGlyph name="chevron-right" :size="16" /></button></div>
+        </section>
+      </div>
+    </Transition>
 
     <div v-if="taskModalOpen" class="modal-backdrop" @click.self="taskModalOpen = false">
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header><div><span class="eyebrow">新建</span><h2 id="task-modal-title">添加任务</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="taskModalOpen = false"><IconGlyph name="close" /></button></header><form @submit.prevent="createTask"><label>任务内容<input v-model="taskForm.title" autofocus placeholder="例如：完成软件工程需求分析" /></label><div class="form-grid"><label>课程或分类<input v-model="taskForm.course" placeholder="个人计划" /></label><label>截止时间<input v-model="taskForm.dueAt" type="datetime-local" /></label></div><label>提前提醒（分钟）<input v-model.number="taskForm.reminderMinutes" type="number" min="0" max="10080" step="1" placeholder="0 表示到点提醒" /></label><label class="switch-row modal-switch"><span><strong>静默时段仍提醒</strong><small>仅为确实不能错过的任务开启</small></span><input v-model="taskForm.remindDuringQuiet" type="checkbox" role="switch" /></label><footer><button class="secondary-button" type="button" @click="taskModalOpen = false">取消</button><button class="primary-button" type="submit">添加任务</button></footer></form></section>
@@ -1927,7 +2346,7 @@ function runAssistantAction(message: AssistantMessage): void {
         <header><div><span class="eyebrow">步骤 {{ importStep }} / 3</span><h2 id="import-modal-title">导入课表</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="courseImportOpen = false"><IconGlyph name="close" /></button></header>
         <div class="step-indicator"><span v-for="step in 3" :key="step" :class="{ active: step <= importStep }" /></div>
         <div v-if="importStep === 1" class="import-body">
-          <div class="import-options"><button type="button" :class="{ active: importMode === 'class' }" @click="importMode = 'class'; importError = ''"><IconGlyph name="book" :size="24" /><strong>按班级导入</strong><span>使用已配置的教务系统会话读取</span></button><button type="button" :class="{ active: importMode === 'file' }" @click="importMode = 'file'; importError = ''"><IconGlyph name="upload" :size="24" /><strong>上传课表文件</strong><span>浏览器本地解析 XLS/XLSX/CSV</span></button></div>
+          <div class="import-options"><button type="button" :class="{ active: importMode === 'class' }" @click="importMode = 'class'; importError = ''"><IconGlyph name="book" :size="24" /><strong>按班级导入</strong><span>使用已配置的教务系统会话读取</span></button><button type="button" :class="{ active: importMode === 'file' }" @click="importMode = 'file'; importError = ''"><IconGlyph name="upload" :size="24" /><strong>上传课表文件</strong><span>在本机解析 XLS/XLSX/CSV</span></button></div>
           <label v-if="importMode === 'class'">班级号<input v-model="importClassId" placeholder="请输入完整班级号" /></label>
           <label v-else class="file-drop"><IconGlyph name="upload" :size="26" /><strong>{{ importFile?.name || '选择课表文件' }}</strong><span>{{ importPreview.length ? `已识别 ${importPreview.length} 门课程` : '文件只在本机解析，不会上传到第三方' }}</span><input type="file" accept=".xls,.xlsx,.csv" @change="selectImportFile" /></label>
           <p v-if="importError" class="form-error" role="alert">{{ importError }}</p>
@@ -1941,14 +2360,37 @@ function runAssistantAction(message: AssistantMessage): void {
     <div v-if="selectedCourse" class="drawer-backdrop" @click.self="selectedCourse = null">
       <aside class="drawer" role="dialog" aria-modal="true" aria-label="课程详情">
         <header><span class="course-detail-mark" :class="`course-${selectedCourse.color}`" /><button class="icon-button" type="button" aria-label="关闭" @click="selectedCourse = null"><IconGlyph name="close" /></button></header>
-        <template v-if="!courseEditing"><span class="eyebrow">{{ weekdays[selectedCourse.weekday - 1] ?? `周${selectedCourse.weekday}` }} · 第 {{ selectedCourse.startSection }}–{{ selectedCourse.endSection }} 节</span><h2>{{ selectedCourse.name }}</h2><div class="detail-list"><div><IconGlyph name="clock" /><span><small>上课时间</small><strong>{{ selectedCourse.startTime }}–{{ selectedCourse.endTime }}</strong></span></div><div><IconGlyph name="map" /><span><small>地点</small><strong>{{ selectedCourse.location }}</strong></span></div><div><IconGlyph name="book" /><span><small>教师与周次</small><strong>{{ selectedCourse.teacher }} · {{ selectedCourse.weeks }}</strong></span></div><div><IconGlyph name="bell" /><span><small>提醒</small><strong>{{ formatReminder(selectedCourse.reminderMinutes) }}</strong></span></div></div><button class="primary-button full" type="button" @click="startCourseEdit">编辑课程</button></template>
-        <form v-else class="course-edit-form" @submit.prevent="saveCourse"><span class="eyebrow">编辑课程</span><label>课程名<input v-model="courseForm.name" autofocus /></label><div class="form-grid"><label>教师<input v-model="courseForm.teacher" /></label><label>地点<input v-model="courseForm.location" /></label></div><div class="form-grid"><label>星期<select v-model.number="courseForm.weekday"><option v-for="(day,index) in weekdayOptions" :key="day" :value="index + 1">{{ day }}</option></select></label><label>周次<input v-model="courseForm.weeks" placeholder="1-2，4-10" inputmode="numeric" /></label></div><div class="form-grid"><label>开始节次<input v-model.number="courseForm.startSection" type="number" min="1" max="20" /></label><label>结束节次<input v-model.number="courseForm.endSection" type="number" min="1" max="20" /></label></div><label>提前提醒（分钟）<input v-model.number="courseForm.reminderMinutes" type="number" min="0" max="10080" step="1" /></label><button class="danger-button course-delete-button" :class="{ confirming: courseDeleteConfirming }" type="button" @click="deleteSelectedCourse">{{ courseDeleteConfirming ? '确认删除课程' : '删除课程' }}</button><footer><button class="secondary-button" type="button" @click="courseEditing = false; courseDeleteConfirming = false">取消</button><button class="primary-button" type="submit">保存修改</button></footer></form>
+        <template v-if="!courseEditing"><span class="eyebrow">{{ weekdays[selectedCourse.weekday - 1] ?? `周${selectedCourse.weekday}` }} · 第 {{ selectedCourse.startSection }}–{{ selectedCourse.endSection }} 节</span><h2>{{ selectedCourse.name }}</h2><div class="detail-list"><div><IconGlyph name="clock" /><span><small>上课时间</small><strong>{{ selectedCourse.startTime }}–{{ selectedCourse.endTime }}</strong></span></div><div><IconGlyph name="map" /><span><small>地点</small><strong>{{ selectedCourse.location }}</strong></span></div><div><IconGlyph name="book" /><span><small>教师与周次</small><strong>{{ selectedCourse.teacher }} · {{ selectedCourse.weeks }}</strong></span></div><div><IconGlyph name="bell" /><span><small>提醒</small><strong>{{ formatReminder(selectedCourse.reminderMinutes) }}</strong></span></div></div><button class="primary-button full" type="button" @click="startCourseEdit">编辑课程</button><button class="danger-button course-delete-button" :class="{ confirming: courseDeleteConfirming }" type="button" @click="deleteSelectedCourse">{{ courseDeleteConfirming ? '确认删除课程' : '删除课程' }}</button></template>
+        <form v-else class="course-edit-form" @submit.prevent="saveCourse"><span class="eyebrow">编辑课程</span><label>课程名<input v-model="courseForm.name" autofocus /></label><div class="form-grid"><label>教师<input v-model="courseForm.teacher" /></label><label>地点<input v-model="courseForm.location" /></label></div><div class="form-grid"><label>星期<select v-model.number="courseForm.weekday"><option v-for="(day,index) in weekdayOptions" :key="day" :value="index + 1">{{ day }}</option></select></label><label>周次<input v-model="courseForm.weeks" placeholder="1-2，4-10" inputmode="numeric" /></label></div><div class="form-grid"><label>开始节次<input v-model.number="courseForm.startSection" type="number" min="1" max="20" /></label><label>结束节次<input v-model.number="courseForm.endSection" type="number" min="1" max="20" /></label></div><label>提前提醒（分钟）<input v-model.number="courseForm.reminderMinutes" type="number" min="0" max="10080" step="1" /></label><footer><button class="secondary-button" type="button" @click="courseEditing = false; courseDeleteConfirming = false">取消</button><button class="primary-button" type="submit">保存修改</button></footer></form>
       </aside>
     </div>
 
     <div v-if="selectedCampusItem" class="modal-backdrop" @click.self="selectedCampusItem = null"><section class="modal campus-detail" role="dialog" aria-modal="true" aria-label="校园信息详情"><header><span class="category-chip">{{ selectedCampusItem.category }}</span><button class="icon-button" type="button" aria-label="关闭" @click="selectedCampusItem = null"><IconGlyph name="close" /></button></header><h2>{{ selectedCampusItem.title }}</h2><div v-if="campusSummaryBusy" class="summary-loading"><IconGlyph name="assistant" /><span>AI 正在阅读官方通知并生成总结…</span></div><p v-else-if="selectedCampusItem.summary">{{ selectedCampusItem.summary }}</p><p v-else-if="campusSummaryError" class="form-error" role="alert">{{ campusSummaryError }}</p><p v-else>该条目暂时没有可显示的简介。</p><dl><div><dt>来源</dt><dd>{{ selectedCampusItem.source }}</dd></div><div><dt>发布时间</dt><dd>{{ formatDateTime(selectedCampusItem.publishedAt) }}</dd></div><div v-if="selectedCampusItem.eventTime"><dt>活动时间</dt><dd>{{ formatDateTime(selectedCampusItem.eventTime) }}</dd></div></dl><footer><button class="secondary-button" type="button" @click="toggleCampusSubscription(selectedCampusItem)">{{ selectedCampusItem.subscribed ? '取消订阅' : '订阅更新' }}</button><a class="primary-button" :href="selectedCampusItem.url" target="_blank" rel="noopener noreferrer"><IconGlyph name="external" />查看原文</a></footer></section></div>
 
-    <div v-if="!profileName" class="welcome-screen"><div ref="welcomeOrbsContainer" class="welcome-orbs" aria-hidden="true"><span v-for="orb in welcomeOrbs" :key="orb.id" :style="{ width: `${orb.radius * 2}px`, height: `${orb.radius * 2}px`, '--orb-hue': String(orb.hue), transform: `translate3d(${orb.x - orb.radius}px, ${orb.y - orb.radius}px, 0)` }" /></div><section class="welcome-card" role="dialog" aria-modal="true" aria-labelledby="welcome-title"><span class="brand-mark">邮</span><span class="eyebrow">北邮人的学习与生活助手</span><h1 id="welcome-title">欢迎使用邮学伴</h1><p>课程、任务、校园信息和 AI 助手都在这里。开始前，想先知道该怎么称呼你。</p><form @submit.prevent="completeWelcome"><label for="welcome-name">你的称呼</label><input id="welcome-name" v-model="welcomeName" autofocus maxlength="20" placeholder="例如：小林、林同学" @input="welcomeError = ''" /><small v-if="welcomeError" class="form-error" role="alert">{{ welcomeError }}</small><button class="primary-button" type="submit">开始使用</button></form><small>称呼只保存在这台设备的浏览器中，可随时清除。</small></section></div>
+    <div v-if="accountLogoutConfirmOpen" class="modal-backdrop" @click.self="accountLogoutConfirmOpen = false">
+      <section class="modal logout-modal" role="dialog" aria-modal="true" aria-labelledby="logout-modal-title">
+        <header><div><span class="eyebrow">退出当前账号</span><h2 id="logout-modal-title">确认退出登录？</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="accountLogoutConfirmOpen = false"><IconGlyph name="close" /></button></header>
+        <p>退出后，本机保存的个人资料、任务、课程、设置和对话仍会保留，下次登录会继续显示。</p>
+        <p>为保护账号，本机保存的登录密码和自动登录设置会被清除；下次登录需要重新输入账号和密码。</p>
+        <footer><button class="secondary-button" type="button" :disabled="accountLogoutBusy" @click="accountLogoutConfirmOpen = false">取消</button><button class="primary-button" type="button" :disabled="accountLogoutBusy" @click="logoutAccount">{{ accountLogoutBusy ? '正在退出…' : '确认退出' }}</button></footer>
+      </section>
+    </div>
+
+    <div v-if="passwordChangeOpen" class="modal-backdrop" @click.self="!passwordChangeBusy && (passwordChangeOpen = false)">
+      <section class="modal password-modal" role="dialog" aria-modal="true" aria-labelledby="password-modal-title">
+        <header><div><span class="eyebrow">账号安全</span><h2 id="password-modal-title">修改密码</h2></div><button class="icon-button" type="button" aria-label="关闭" :disabled="passwordChangeBusy" @click="passwordChangeOpen = false"><IconGlyph name="close" /></button></header>
+        <form @submit.prevent="changePassword">
+          <label>原密码<input v-model="passwordChangeForm.currentPassword" type="password" autocomplete="current-password" placeholder="请输入原密码" /></label>
+          <label>新密码<input v-model="passwordChangeForm.newPassword" type="password" autocomplete="new-password" placeholder="6 到 128 个字符" /></label>
+          <label>确认新密码<input v-model="passwordChangeForm.confirmPassword" type="password" autocomplete="new-password" placeholder="再次输入新密码" /></label>
+          <p v-if="passwordChangeError" class="form-error" role="alert">{{ passwordChangeError }}</p>
+          <p class="modal-note">修改成功后会退出当前登录，需要使用新密码重新登录。</p>
+          <footer><button class="secondary-button" type="button" :disabled="passwordChangeBusy" @click="passwordChangeOpen = false">取消</button><button class="primary-button" type="submit" :disabled="passwordChangeBusy">{{ passwordChangeBusy ? '正在修改…' : '确认修改' }}</button></footer>
+        </form>
+      </section>
+    </div>
+
+    <div v-if="!profileName" class="welcome-screen"><div ref="welcomeOrbsContainer" class="welcome-orbs" aria-hidden="true"><span v-for="orb in welcomeOrbs" :key="orb.id" :style="{ width: `${orb.radius * 2}px`, height: `${orb.radius * 2}px`, '--orb-hue': String(orb.hue), transform: `translate3d(${orb.x - orb.radius}px, ${orb.y - orb.radius}px, 0)` }" /></div><section class="welcome-card" role="dialog" aria-modal="true" aria-labelledby="welcome-title"><span class="brand-mark">邮</span><span class="eyebrow">北邮人的学习与生活助手</span><h1 id="welcome-title">欢迎使用邮学伴</h1><p>课程、任务、校园信息和 AI 助手都在这里。开始前，想先知道该怎么称呼你。</p><form @submit.prevent="completeWelcome"><label for="welcome-name">你的称呼</label><input id="welcome-name" v-model="welcomeName" autofocus maxlength="20" placeholder="例如：小林、林同学" @input="welcomeError = ''" /><small v-if="welcomeError" class="form-error" role="alert">{{ welcomeError }}</small><button class="primary-button" type="submit">开始使用</button></form><small>称呼只保存在这台设备中，可随时清除。</small></section></div>
 
     <Transition name="toast"><div v-if="toast" class="toast" role="status"><IconGlyph name="check" />{{ toast }}</div></Transition>
   </div>
