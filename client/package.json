@@ -1,7 +1,7 @@
 {
   "name": "youxueban-client",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.1",
   "description": "邮学伴桌面客户端",
   "main": "main.cjs",
   "scripts": {
@@ -9,6 +9,9 @@
     "dev": "electron .",
     "build:web": "pnpm --dir ../web run build",
     "dist:win": "pnpm run build:web && node build-win.cjs"
+  },
+  "dependencies": {
+    "playwright": "1.62.0"
   },
   "devDependencies": {
     "electron": "^38.0.0",
@@ -24,6 +27,8 @@
     },
     "files": [
       "main.cjs",
+      "local-runtime.cjs",
+      "playwright-auth.cjs",
       "preload.cjs",
       "package.json",
       {
@@ -34,6 +39,9 @@
         ]
       }
     ],
-    "win": {}
+    "win": {
+      "icon": "resources/app-icon.png",
+      "artifactName": "YouXueBan-${version}-Windows-${arch}.${ext}"
+    }
   }
 }

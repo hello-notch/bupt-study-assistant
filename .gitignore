@@ -17,12 +17,17 @@ password.txt
 playwright-report/
 test-results/
 .test-tmp/
+output/
+QRcode.*
+web/src/assets/QRcode.*
 web/node_modules/
 web/dist/
 web/.vite/
 client/node_modules/
 client/dist/
+client/.playwright-browsers/
 *.tsbuildinfo
+mobile/
 
 # Local coding-agent workspace metadata
 .agents/

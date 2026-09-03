@@ -4,7 +4,8 @@ import "katex/dist/katex.min.css";
 import IconGlyph from "./components/IconGlyph.vue";
 import { renderAssistantContent } from "./assistant-markdown";
 import { courseTimes, normalizeImportedCourses, normalizeWeeks, parseCourseFile, type ImportedCourse } from "./course-import";
-import { apiFetch, clearSavedLogin, logoutSession, setAccessToken } from "./auth";
+import { apiFetch } from "./auth";
+import { TEXTS } from "./texts";
 import type {
   AssistantAttachment,
   AssistantConversation,
@@ -13,6 +14,7 @@ import type {
   AssistantToolCall,
   AppNotification,
   CampusItem,
+  CampusKind,
   Course,
   ElectricityResult,
   PageId,
@@ -22,6 +24,7 @@ import type {
 
 type ReminderUnit = "minutes" | "hours" | "days";
 type ImportStrategy = "replace" | "merge";
+type ImportMode = "mine" | "file";
 interface AssistantRuntimeInfo {
   provider: string;
   model: string;
@@ -59,12 +62,18 @@ interface AssistantToolResult {
   success: boolean;
   [key: string]: unknown;
 }
+interface LocalSettingsStatus {
+  campus: { configured: boolean; ssoAccount: string; jwglAccount: string };
+  ai: { configured: boolean; baseUrl: string; model: string };
+}
 
 class AssistantCompletionError extends Error {
   constructor(message: string, readonly usage?: AssistantTokenUsage) {
     super(message);
   }
 }
+
+const DEEPSEEK_API_URL = "https://api.deepseek.com";
 
 const assistantTools: Array<Record<string, unknown>> = [
   assistantFunction("course_list", "查看当前课表，可按星期筛选", {
@@ -86,16 +95,17 @@ const assistantTools: Array<Record<string, unknown>> = [
   }, []),
   assistantFunction("ddl_show", "查看一条 DDL", { ddl_id: { type: "integer", minimum: 1 } }, ["ddl_id"]),
   assistantFunction("ddl_add", "添加 DDL；deadline 支持 1分钟后、明天15:30 或 ISO 时间，reminder_minutes=0 表示截止时提醒", {
-    content: { type: "string" }, deadline: { type: "string" }, reminder_minutes: { type: ["integer", "null"], minimum: 0, maximum: 10080 },
+    content: { type: "string" }, deadline: { type: "string" }, reminder_minutes: { type: ["integer", "null"], minimum: 0, maximum: 10080 }, remind_during_quiet: { type: "boolean" },
   }, ["content", "deadline"]),
   assistantFunction("ddl_edit", "编辑一条未完成 DDL", {
     ddl_id: { type: "integer", minimum: 1 }, content: { type: "string" }, deadline: { type: "string" },
-    reminder_minutes: { type: ["integer", "null"], minimum: 0, maximum: 10080 },
+    reminder_minutes: { type: ["integer", "null"], minimum: 0, maximum: 10080 }, remind_during_quiet: { type: "boolean" },
   }, ["ddl_id"]),
   assistantFunction("ddl_remind", "设置一条 DDL 的提醒，0 表示截止时提醒，null 表示关闭", {
-    ddl_id: { type: "integer", minimum: 1 }, reminder_minutes: { type: ["integer", "null"], minimum: 0, maximum: 10080 },
+    ddl_id: { type: "integer", minimum: 1 }, reminder_minutes: { type: ["integer", "null"], minimum: 0, maximum: 10080 }, remind_during_quiet: { type: "boolean" },
   }, ["ddl_id", "reminder_minutes"]),
   assistantFunction("ddl_done", "把一条 DDL 标记为完成", { ddl_id: { type: "integer", minimum: 1 } }, ["ddl_id"]),
+  assistantFunction("ddl_delete", "删除一条 DDL", { ddl_id: { type: "integer", minimum: 1 } }, ["ddl_id"]),
   assistantFunction("campus_query", "查看已加载的信息门户通知或第二课堂活动", {
     kind: { type: "string", enum: ["notice", "activity", "all"] }, query: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 20 },
   }, []),
@@ -106,15 +116,15 @@ function assistantFunction(name: string, description: string, properties: Record
   return { type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } };
 }
 
-const STORAGE_KEY = "youxueban-state-v8";
-const LEGACY_STORAGE_KEYS = ["youxueban-state-v7", "youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
+const STORAGE_KEY = "youxueban-state-v9";
+const LEGACY_STORAGE_KEYS = ["youxueban-state-v8", "youxueban-state-v7", "youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
 const MAX_ASSISTANT_FILE_SIZE = 1_000_000;
 const MAX_ASSISTANT_ATTACHMENTS = 2;
 const ASSISTANT_TOKEN_ESTIMATE_OVERHEAD = 300;
 const ASSISTANT_IMAGE_TOKEN_ESTIMATE = 1_100;
 const MAX_ACADEMIC_WEEK = 22;
-const ASSISTANT_GREETING = "你好，你可以问我学习问题。我可以结合你的课程、DDL、校园通知和电费回答问题，也能按你的要求查看或编辑课程和 DDL。";
-const LEGACY_ASSISTANT_GREETING = "你好，我可以结合你的课程、任务与校园信息回答问题，也能帮你规划学习安排。";
+const ASSISTANT_GREETING = "你好，你可以问我学习问题我可以结合你的课程、DDL、校园通知和电费回答问题，也能按你的要求查看或编辑课程和 DDL";
+const LEGACY_ASSISTANT_GREETING = "你好，我可以结合你的课程、任务与校园信息回答问题，也能帮你规划学习安排";
 const weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const weekdayOptions = ["一", "二", "三", "四", "五", "六", "日"];
 const courseColors: Course["color"][] = ["blue", "violet", "green", "orange", "rose", "cyan", "indigo", "teal"];
@@ -126,7 +136,7 @@ const sectionRows = Array.from({ length: 14 }, (_, index) => {
 const campusServices = [
   { name: "信息门户", description: "通知、办事与校内服务", url: "http://my.bupt.edu.cn/" },
   { name: "教学云平台", description: "查看作业与课件", url: "https://ucloud.bupt.edu.cn/uclass/#/student/homePage" },
-  { name: "教务系统", description: "课表、成绩与教学事务", url: "https://jwgl.bupt.edu.cn/jsxsd/" },
+  { name: "教务系统", description: "课表、成绩与教学事务", url: "https://jwgl.bupt.edu.cn/" },
 ];
 const navItems: Array<{ id: PageId; label: string; icon: string }> = [
   { id: "today", label: "今天", icon: "today" },
@@ -140,7 +150,7 @@ const mobilePrimaryNavItems = navItems.filter((item) => ["today", "tasks", "cour
 const mobileMoreNavItems: Array<{ id: PageId; label: string; icon: string; description: string }> = [
   { id: "campus", label: "校园服务", icon: "campus", description: "通知与第二课堂" },
   { id: "electricity", label: "宿舍电费", icon: "electricity", description: "查询余额与提醒" },
-  { id: "notifications", label: "消息中心", icon: "bell", description: "课程、任务与订阅" },
+  { id: "notifications", label: "消息中心", icon: "bell", description: "课程、任务与校园动态" },
   { id: "settings", label: "偏好设置", icon: "settings", description: "外观、提醒与隐私" },
 ];
 
@@ -152,6 +162,7 @@ const defaultPreferences: Preferences = {
   semesterStart: "2026-08-30",
   quietStart: "23:00",
   quietEnd: "07:00",
+  soundNotifications: true,
   browserNotifications: true,
   memoryEnabled: true,
   analyticsEnabled: true,
@@ -201,16 +212,7 @@ const conversationGliderStyle = computed(() => ({
   opacity: conversationGlider.value.visible ? "1" : "0",
   transform: `translate3d(${conversationGlider.value.x}px, ${conversationGlider.value.y}px, 0)`,
 }));
-const authNickname = (() => {
-  try {
-    const raw = sessionStorage.getItem("youxueban-auth-user");
-    const value = raw ? JSON.parse(raw) as { nickname?: unknown } : {};
-    return typeof value.nickname === "string" ? value.nickname.trim() : "";
-  } catch {
-    return "";
-  }
-})();
-const profileName = ref(saved.profileName?.trim() || authNickname);
+const profileName = ref(saved.profileName?.trim() || "");
 const profileAvatar = ref(isImageDataUrl(saved.profileAvatar) ? saved.profileAvatar : "");
 const profileDraftName = ref(profileName.value);
 const profileDraftAvatar = ref(profileAvatar.value);
@@ -236,10 +238,10 @@ const courseReminderValue = ref(String(preferences.value.courseReminder));
 const lastValidCourseReminder = ref(preferences.value.courseReminder);
 const toast = ref("");
 const taskModalOpen = ref(false);
+const editingTaskId = ref<number | null>(null);
 const courseImportOpen = ref(false);
 const importStep = ref(1);
-const importMode = ref<"class" | "file">("class");
-const importClassId = ref("");
+const importMode = ref<ImportMode>("mine");
 const importFile = ref<File | null>(null);
 const importPreview = ref<ImportedCourse[]>([]);
 const importSelections = ref<boolean[]>([]);
@@ -288,19 +290,31 @@ const electricityResult = ref<ElectricityResult | null>(null);
 const electricityBusy = ref(false);
 const electricityError = ref("");
 const electricityEditing = ref(!electricityDormitory.value);
-const accountLogoutBusy = ref(false);
-const accountLogoutConfirmOpen = ref(false);
-const passwordChangeBusy = ref(false);
-const passwordChangeOpen = ref(false);
-const passwordChangeError = ref("");
-const passwordChangeForm = ref({ currentPassword: "", newPassword: "", confirmPassword: "" });
+const localSettings = ref<LocalSettingsStatus>({
+  campus: { configured: false, ssoAccount: "", jwglAccount: "" },
+  ai: { configured: false, baseUrl: "", model: "" },
+});
+const accountBindingOpen = ref(false);
+const accountBindingBusy = ref(false);
+const accountBindingError = ref("");
+const accountBindingForm = ref({ ssoAccount: "", ssoPassword: "", jwglAccount: "", jwglPassword: "" });
+const aiConfigOpen = ref(false);
+const aiConfigBusy = ref(false);
+const aiConfigError = ref("");
+const aiModels = ref<string[]>([]);
+const aiConfigForm = ref({ baseUrl: DEEPSEEK_API_URL, apiKey: "", model: "" });
+const campusDeleteConfirming = ref(false);
+const aiDeleteConfirming = ref(false);
 const sidebarWidth = ref(Math.max(190, Math.min(320, Number(saved.sidebarWidth) || 224)));
 let clockTimer: number | undefined;
 let reminderTimer: number | undefined;
 let resetConfirmTimer: number | undefined;
 let courseClearConfirmTimer: number | undefined;
 let courseDeleteConfirmTimer: number | undefined;
+let deleteConfirmTimer: number | undefined;
 let assistantDeleteConfirmTimer: number | undefined;
+let campusDeleteConfirmTimer: number | undefined;
+let aiDeleteConfirmTimer: number | undefined;
 let sidebarResizeCleanup: (() => void) | undefined;
 let sidebarGliderFrame: number | undefined;
 let sidebarGliderResizeObserver: ResizeObserver | undefined;
@@ -369,9 +383,6 @@ const assistantThinkingEnabled = computed({
     activeConversation.value.updatedAt = new Date().toISOString();
   },
 });
-const assistantModelLabel = computed(() => assistantRuntime.value?.model === "deepseek-v4-flash-vision-exp"
-  ? "DeepSeek-V4-Flash-Vision-Exp"
-  : assistantRuntime.value?.model ?? "");
 const assistantContextThreshold = computed(() => assistantRuntime.value?.contextBlockThreshold
   ?? Math.floor((assistantRuntime.value?.contextWindow ?? 0) * 0.9));
 const assistantContextBaseTokens = computed(() => activeConversation.value.tokenUsage?.totalTokens
@@ -405,8 +416,14 @@ const filteredCampusItems = computed(() => {
     .filter((item) => !query || `${item.title} ${item.summary} ${item.category}`.toLowerCase().includes(query));
   return campusTab.value === "notice" ? matches.slice(0, portalVisibleCount.value) : matches;
 });
+const todayCampusItems = computed(() => [...campusItems.value].sort((a, b) => {
+  const aTodo = a.category === "待办中心" ? 1 : 0;
+  const bTodo = b.category === "待办中心" ? 1 : 0;
+  return bTodo - aTodo || b.publishedAt.localeCompare(a.publishedAt);
+}).slice(0, 5));
 const portalItemCount = computed(() => campusItems.value.filter((item) => item.kind === "notice").length);
 const canLoadMorePortalItems = computed(() => portalVisibleCount.value < Math.min(50, portalItemCount.value));
+const campusNeedsRelogin = computed(() => campusStatuses.value.some((status) => status.mode === "error" || status.mode === "cache"));
 const activityIsEmptyOnline = computed(() => campusTab.value === "activity"
   && !campusSearch.value.trim()
   && campusStatuses.value.some((status) => status.source === "activity" && status.mode === "online" && status.itemCount === 0));
@@ -415,17 +432,17 @@ const listedAssistantConversations = computed(() => assistantConversations.value
 const studySuggestions = computed(() => {
   if (!preferences.value.analyticsEnabled) {
     return [
-      "可以选一项当下最想推进的事情，专注 20 分钟后再决定下一步。",
-      "如果有些疲惫，先休息十分钟，再从一个足够小的步骤开始。",
-      "整理一下手边资料，为下一次学习减少启动成本。",
+      "可以选一项当下最想推进的事情，专注 20 分钟后再决定下一步",
+      "如果有些疲惫，先休息十分钟，再从一个足够小的步骤开始",
+      "整理一下手边资料，为下一次学习减少启动成本",
     ];
   }
   const suggestions: string[] = [];
   const nearest = todoTasks.value[0];
-  if (nearest) suggestions.push(`先处理最临近的“${nearest.title}”，用 25 分钟完成一个清晰的小步骤。`);
-  if (nextCourse.value) suggestions.push(`下一节是“${nextCourse.value.name}”，可以先用 15 分钟回顾上次笔记并列出两个问题。`);
-  if (todoTasks.value.length > 1) suggestions.push(`从 ${todoTasks.value.length} 项待办里选一项预计 30 分钟内能推进的任务，完成后再重新排序。`);
-  suggestions.push("暂时没有紧急事项，可以整理课程资料、回顾今天的笔记，或者休息十分钟。", "选一门本周课程，用 20 分钟建立一页知识框架，再标出最不熟悉的部分。", "清理一次下载目录和课程文件夹，让下一次开始学习时少一点阻力。");
+  if (nearest) suggestions.push(`先处理最临近的“${nearest.title}”，用 25 分钟完成一个清晰的小步骤`);
+  if (nextCourse.value) suggestions.push(`下一节是“${nextCourse.value.name}”，可以先用 15 分钟回顾上次笔记并列出两个问题`);
+  if (todoTasks.value.length > 1) suggestions.push(`从 ${todoTasks.value.length} 项待办里选一项预计 30 分钟内能推进的任务，完成后再重新排序`);
+  suggestions.push("暂时没有紧急事项，可以整理课程资料、回顾今天的笔记，或者休息十分钟", "选一门本周课程，用 20 分钟建立一页知识框架，再标出最不熟悉的部分", "清理一次下载目录和课程文件夹，让下一次开始学习时少一点阻力");
   return suggestions;
 });
 const currentSuggestion = computed(() => studySuggestions.value[suggestionIndex.value % studySuggestions.value.length]);
@@ -446,7 +463,7 @@ watch([profileName, profileAvatar, tasks, courses, campusItems, notifications, p
       sidebarWidth: sidebarWidth.value,
     }));
   } catch {
-    showToast("对话中的图片较多，本机存储空间不足");
+    showToast(TEXTS.common.storageFull);
   }
 }, { deep: true });
 
@@ -465,6 +482,9 @@ watch(currentPage, () => {
   updateConversationGlider();
 });
 watch([activeConversationId, () => listedAssistantConversations.value.length], () => updateConversationGlider());
+watch(accountBindingOpen, (open, previous) => {
+  if (previous && !open && currentPage.value === "assistant" && !localSettings.value.ai.configured) openAiConfig();
+});
 
 watch(assistantInput, async () => {
   await nextTick();
@@ -489,14 +509,19 @@ onMounted(async () => {
   if ("scrollRestoration" in history) history.scrollRestoration = "manual";
   window.scrollTo({ top: 0, behavior: "auto" });
   clockTimer = window.setInterval(() => { clock.value = new Date(); }, 1000);
-  reminderTimer = window.setInterval(checkDueReminders, 15_000);
+  reminderTimer = window.setInterval(checkDueReminders, 5_000);
+  window.addEventListener("focus", checkDueReminders);
+  document.addEventListener("visibilitychange", checkRemindersWhenVisible);
+  checkDueReminders();
+  await refreshLocalSettings();
+  if (localSettings.value.ai.configured) void detectAiModels();
   try {
     const response = await apiFetch("/api/config");
     const payload = await response.json() as { semesterStart?: string; assistant?: AssistantRuntimeInfo };
     if (response.ok && /^\d{4}-\d{2}-\d{2}$/.test(payload.semesterStart ?? "")) preferences.value.semesterStart = payload.semesterStart!;
-    if (response.ok && payload.assistant?.model) assistantRuntime.value = payload.assistant;
+    if (response.ok && localSettings.value.ai.configured && payload.assistant?.model) assistantRuntime.value = payload.assistant;
   } catch {
-    // The editable local semester start remains available when the service is offline.
+    // Local settings remain editable when an upstream service is offline.
   }
   selectedWeek.value = Math.max(1, Math.min(MAX_ACADEMIC_WEEK, currentAcademicWeek.value));
   await nextTick();
@@ -507,10 +532,12 @@ onMounted(async () => {
     sidebarGliderResizeObserver.observe(sidebarRef.value);
   }
   if (!profileName.value && !preferences.value.reduceMotion) startWelcomeOrbs();
-  await Promise.all([
-    loadCampusData(),
-    electricityDormitory.value ? queryElectricity(true) : Promise.resolve(),
-  ]);
+  if (profileName.value && !localSettings.value.campus.configured) openAccountBinding();
+  if (currentPage.value === "assistant" && !localSettings.value.ai.configured && !accountBindingOpen.value) aiConfigOpen.value = true;
+  if (localSettings.value.campus.configured) {
+    await loadCampusData();
+    if (electricityDormitory.value) await queryElectricity(true);
+  }
   await nextTick();
   window.scrollTo({ top: 0, behavior: "auto" });
 });
@@ -521,7 +548,12 @@ onBeforeUnmount(() => {
   if (resetConfirmTimer !== undefined) window.clearTimeout(resetConfirmTimer);
   if (courseClearConfirmTimer !== undefined) window.clearTimeout(courseClearConfirmTimer);
   if (courseDeleteConfirmTimer !== undefined) window.clearTimeout(courseDeleteConfirmTimer);
+  if (deleteConfirmTimer !== undefined) window.clearTimeout(deleteConfirmTimer);
   if (assistantDeleteConfirmTimer !== undefined) window.clearTimeout(assistantDeleteConfirmTimer);
+  if (campusDeleteConfirmTimer !== undefined) window.clearTimeout(campusDeleteConfirmTimer);
+  if (aiDeleteConfirmTimer !== undefined) window.clearTimeout(aiDeleteConfirmTimer);
+  window.removeEventListener("focus", checkDueReminders);
+  document.removeEventListener("visibilitychange", checkRemindersWhenVisible);
   sidebarResizeCleanup?.();
   sidebarGliderResizeObserver?.disconnect();
   if (sidebarGliderFrame !== undefined) window.cancelAnimationFrame(sidebarGliderFrame);
@@ -748,10 +780,12 @@ function isCampusItemReadable(item: CampusItem): boolean {
 }
 
 function navigate(page: PageId): void {
+  clearTaskDeleteConfirmation();
   window.scrollTo({ top: 0, behavior: "auto" });
   currentPage.value = page;
   mobileMoreOpen.value = false;
   location.hash = `/${page}`;
+  if (page === "assistant" && !localSettings.value.ai.configured) openAiConfig();
   void nextTick(() => window.scrollTo({ top: 0, behavior: "auto" }));
 }
 
@@ -827,20 +861,168 @@ function showToast(message: string): void {
 async function completeWelcome(): Promise<void> {
   const name = welcomeName.value.trim();
   if (!name) {
-    welcomeError.value = "请先告诉我该怎么称呼你";
+    welcomeError.value = TEXTS.welcome.nameRequired;
     return;
   }
   profileName.value = name.slice(0, 20);
   profileDraftName.value = profileName.value;
   welcomeError.value = "";
-  showToast(`欢迎你，${profileName.value}`);
-  if (!campusItems.value.length) await loadCampusData();
+  showToast(TEXTS.welcome.greeting(profileName.value));
+  if (!localSettings.value.campus.configured) openAccountBinding();
+  else if (!campusItems.value.length) await loadCampusData();
+}
+
+async function refreshLocalSettings(): Promise<void> {
+  try {
+    const response = await apiFetch("/api/local/settings/status");
+    const payload = await response.json() as Partial<LocalSettingsStatus>;
+    if (!response.ok || !payload.campus || !payload.ai) return;
+    localSettings.value = payload as LocalSettingsStatus;
+    accountBindingForm.value.ssoAccount = String(payload.campus.ssoAccount ?? "");
+    accountBindingForm.value.jwglAccount = String(payload.campus.jwglAccount ?? "");
+    aiConfigForm.value.baseUrl = payload.ai.baseUrl;
+    aiConfigForm.value.model = payload.ai.model;
+  } catch {
+    // The form will explain unavailable local runtime when the user opens it.
+  }
+}
+
+function openAccountBinding(): void {
+  accountBindingError.value = "";
+  accountBindingForm.value = {
+    ssoAccount: localSettings.value.campus.ssoAccount,
+    ssoPassword: "",
+    jwglAccount: localSettings.value.campus.jwglAccount,
+    jwglPassword: "",
+  };
+  accountBindingOpen.value = true;
+}
+
+async function saveAccountBinding(): Promise<void> {
+  if (accountBindingBusy.value) return;
+  const form = accountBindingForm.value;
+  if (!form.ssoAccount.trim() || !form.jwglAccount.trim()
+    || (!localSettings.value.campus.configured && (!form.ssoPassword || !form.jwglPassword))) {
+    accountBindingError.value = TEXTS.auth.formIncomplete;
+    return;
+  }
+  accountBindingBusy.value = true;
+  accountBindingError.value = "";
+  try {
+    const response = await apiFetch("/api/local/settings/campus", { method: "POST", body: JSON.stringify(form) });
+    const payload = await response.json() as { error?: string };
+    if (!response.ok) throw new Error(payload.error || TEXTS.auth.verifyFailed);
+    await refreshLocalSettings();
+    accountBindingOpen.value = false;
+    accountBindingForm.value.ssoPassword = "";
+    accountBindingForm.value.jwglPassword = "";
+    showToast(TEXTS.auth.saved);
+    void loadCampusData();
+  } catch (error) {
+    accountBindingError.value = error instanceof Error ? error.message : TEXTS.auth.saveFailed;
+  } finally {
+    accountBindingBusy.value = false;
+  }
+}
+
+async function deleteAccountBinding(): Promise<void> {
+  if (!campusDeleteConfirming.value) {
+    campusDeleteConfirming.value = true;
+    if (campusDeleteConfirmTimer !== undefined) window.clearTimeout(campusDeleteConfirmTimer);
+    campusDeleteConfirmTimer = window.setTimeout(() => { campusDeleteConfirming.value = false; }, 7000);
+    return;
+  }
+  const response = await apiFetch("/api/local/settings/campus", { method: "DELETE" });
+  if (!response.ok) return showToast(TEXTS.auth.deleteFailed);
+  campusDeleteConfirming.value = false;
+  await refreshLocalSettings();
+  accountBindingForm.value = { ssoAccount: "", ssoPassword: "", jwglAccount: "", jwglPassword: "" };
+  campusItems.value = [];
+  campusStatuses.value = [];
+  showToast(TEXTS.auth.deleted);
+}
+
+function openAiConfig(): void {
+  aiConfigError.value = "";
+  aiConfigForm.value = {
+    baseUrl: DEEPSEEK_API_URL,
+    apiKey: "",
+    model: localSettings.value.ai.model,
+  };
+  aiConfigOpen.value = true;
+  void detectAiModels();
+}
+
+async function detectAiModels(): Promise<void> {
+  aiConfigBusy.value = true;
+  aiConfigError.value = "";
+  try {
+    const response = await apiFetch("/api/assistant/models");
+    const payload = await response.json() as { models?: string[]; model?: string; error?: string };
+    if (!response.ok || !payload.models?.length) throw new Error(payload.error || TEXTS.ai.modelsUnavailable);
+    aiModels.value = payload.models;
+    aiConfigForm.value.model = aiConfigForm.value.model && payload.models.includes(aiConfigForm.value.model)
+      ? aiConfigForm.value.model
+      : payload.model || payload.models[0]!;
+  } catch (error) {
+    aiConfigError.value = error instanceof Error ? error.message : TEXTS.ai.modelsUnavailable;
+  } finally {
+    aiConfigBusy.value = false;
+  }
+}
+
+async function saveAiConfig(): Promise<void> {
+  if (aiConfigBusy.value) return;
+  if (!localSettings.value.ai.configured && !aiConfigForm.value.apiKey.trim()) {
+    aiConfigError.value = TEXTS.ai.configRequired;
+    return;
+  }
+  if (!aiConfigForm.value.model) {
+    aiConfigError.value = TEXTS.ai.modelRequired;
+    return;
+  }
+  aiConfigBusy.value = true;
+  aiConfigError.value = "";
+  try {
+    const response = await apiFetch("/api/local/settings/ai", { method: "POST", body: JSON.stringify({ ...aiConfigForm.value, baseUrl: DEEPSEEK_API_URL }) });
+    const payload = await response.json() as { models?: string[]; model?: string; error?: string };
+    if (!response.ok) throw new Error(payload.error || TEXTS.ai.configSaveFailed);
+    aiModels.value = payload.models ?? [];
+    if (payload.model) aiConfigForm.value.model = payload.model;
+    await refreshLocalSettings();
+    const config = await apiFetch("/api/config");
+    const configPayload = await config.json() as { assistant?: AssistantRuntimeInfo };
+    assistantRuntime.value = configPayload.assistant ?? null;
+    aiConfigOpen.value = false;
+    aiConfigForm.value.apiKey = "";
+    showToast(TEXTS.ai.configured);
+  } catch (error) {
+    aiConfigError.value = error instanceof Error ? error.message : TEXTS.ai.configSaveFailed;
+  } finally {
+    aiConfigBusy.value = false;
+  }
+}
+
+async function deleteAiConfig(): Promise<void> {
+  if (!aiDeleteConfirming.value) {
+    aiDeleteConfirming.value = true;
+    if (aiDeleteConfirmTimer !== undefined) window.clearTimeout(aiDeleteConfirmTimer);
+    aiDeleteConfirmTimer = window.setTimeout(() => { aiDeleteConfirming.value = false; }, 7000);
+    return;
+  }
+  const response = await apiFetch("/api/local/settings/ai", { method: "DELETE" });
+  if (!response.ok) return showToast(TEXTS.ai.configDeleteFailed);
+  aiDeleteConfirming.value = false;
+  await refreshLocalSettings();
+  assistantRuntime.value = null;
+  aiModels.value = [];
+  showToast(TEXTS.ai.deleted);
 }
 
 function saveProfile(): void {
   const name = profileDraftName.value.trim();
   if (!name) {
-    profileEditError.value = "昵称不能为空";
+    profileEditError.value = TEXTS.validation.nicknameRequired;
     return;
   }
   profileName.value = name.slice(0, 20);
@@ -848,7 +1030,7 @@ function saveProfile(): void {
   profileDraftName.value = profileName.value;
   profileDraftAvatar.value = profileAvatar.value;
   profileEditError.value = "";
-  showToast("个人资料已保存");
+  showToast(TEXTS.common.profileSaved);
 }
 
 async function selectAvatarFile(event: Event): Promise<void> {
@@ -857,20 +1039,20 @@ async function selectAvatarFile(event: Event): Promise<void> {
   input.value = "";
   if (!file) return;
   if (!/^(?:image\/png|image\/jpeg|image\/webp)$/.test(file.type)) {
-    profileEditError.value = "请选择 PNG、JPG 或 WebP 图片";
+    profileEditError.value = TEXTS.validation.avatarType;
     return;
   }
   if (file.size > 2 * 1024 * 1024) {
-    profileEditError.value = "头像文件不能超过 2 MB";
+    profileEditError.value = TEXTS.validation.avatarTooLarge;
     return;
   }
   try {
     const dataUrl = await fileToDataUrl(file);
-    if (!isImageDataUrl(dataUrl)) throw new Error("图片格式无效");
+    if (!isImageDataUrl(dataUrl)) throw new Error(TEXTS.validation.avatarType);
     profileDraftAvatar.value = dataUrl;
     profileEditError.value = "";
   } catch {
-    profileEditError.value = "无法读取这张图片，请换一张重试";
+    profileEditError.value = TEXTS.validation.avatarReadFailed;
   }
 }
 
@@ -1006,7 +1188,7 @@ function animateWelcomeOrbs(now: number): void {
   welcomeAnimationFrame = window.requestAnimationFrame(animateWelcomeOrbs);
 }
 
-function resetAllPersonalData(): void {
+async function resetAllPersonalData(): Promise<void> {
   if (!resetConfirming.value) {
     resetConfirming.value = true;
     if (resetConfirmTimer !== undefined) window.clearTimeout(resetConfirmTimer);
@@ -1015,13 +1197,23 @@ function resetAllPersonalData(): void {
   }
   if (resetConfirmTimer !== undefined) window.clearTimeout(resetConfirmTimer);
   if (courseClearConfirmTimer !== undefined) window.clearTimeout(courseClearConfirmTimer);
+  if (campusDeleteConfirmTimer !== undefined) window.clearTimeout(campusDeleteConfirmTimer);
+  if (aiDeleteConfirmTimer !== undefined) window.clearTimeout(aiDeleteConfirmTimer);
+  clearTaskDeleteConfirmation();
+  await resetLocalCredentials();
   [STORAGE_KEY, ...LEGACY_STORAGE_KEYS].forEach((key) => localStorage.removeItem(key));
   profileName.value = "";
   profileAvatar.value = "";
   profileDraftName.value = "";
   profileDraftAvatar.value = "";
   welcomeName.value = "";
+  accountBindingForm.value = { ssoAccount: "", ssoPassword: "", jwglAccount: "", jwglPassword: "" };
+  accountBindingError.value = "";
+  accountBindingOpen.value = false;
+  aiConfigOpen.value = false;
   tasks.value = [];
+  taskModalOpen.value = false;
+  editingTaskId.value = null;
   courses.value = [];
   campusItems.value = [];
   notifications.value = [];
@@ -1044,13 +1236,17 @@ function resetAllPersonalData(): void {
   electricityResult.value = null;
   electricityError.value = "";
   electricityEditing.value = true;
+  localSettings.value = { campus: { configured: false, ssoAccount: "", jwglAccount: "" }, ai: { configured: false, baseUrl: "", model: "" } };
+  campusDeleteConfirming.value = false;
+  aiDeleteConfirming.value = false;
+  aiModels.value = [];
   sidebarWidth.value = 224;
   selectedWeek.value = 1;
   resetConfirming.value = false;
   courseClearConfirming.value = false;
   currentPage.value = "today";
   location.hash = "/today";
-  showToast("个人信息已重置");
+  showToast(TEXTS.common.resetDone);
 }
 
 function clearCourses(): void {
@@ -1065,7 +1261,7 @@ function clearCourses(): void {
   selectedCourse.value = null;
   courseEditing.value = false;
   courseClearConfirming.value = false;
-  showToast("课表已清空");
+  showToast(TEXTS.common.coursesCleared);
 }
 
 function formatDateTime(value: string): string {
@@ -1093,6 +1289,8 @@ function toDateTimeInput(date: Date): string {
 }
 
 function openTaskModal(prefill = ""): void {
+  clearTaskDeleteConfirmation();
+  editingTaskId.value = null;
   const due = new Date();
   due.setDate(due.getDate() + 1);
   due.setHours(20, 0, 0, 0);
@@ -1106,29 +1304,64 @@ function openTaskModal(prefill = ""): void {
   taskModalOpen.value = true;
 }
 
+function openTaskEdit(task: StudyTask): void {
+  clearTaskDeleteConfirmation();
+  editingTaskId.value = task.id;
+  taskForm.value = {
+    title: task.title,
+    course: task.course,
+    dueAt: toDateTimeInput(new Date(task.dueAt)),
+    reminderMinutes: task.reminderMinutes ?? 0,
+    remindDuringQuiet: task.remindDuringQuiet,
+  };
+  taskModalOpen.value = true;
+}
+
 function createTask(): void {
   const title = taskForm.value.title.trim();
   if (!title || !taskForm.value.dueAt) {
-    showToast("请填写任务内容和截止时间");
+    showToast(TEXTS.validation.taskRequired);
     return;
+  }
+  const dueAt = new Date(taskForm.value.dueAt);
+  if (Number.isNaN(dueAt.getTime()) || dueAt.getTime() <= Date.now()) {
+    showToast(TEXTS.validation.taskDuePast);
+    return;
+  }
+  const reminderMinutes = taskForm.value.reminderMinutes == null ? null : Math.max(0, Math.min(10080, Number(taskForm.value.reminderMinutes)));
+  if (editingTaskId.value !== null) {
+    const task = tasks.value.find((item) => item.id === editingTaskId.value);
+    if (task) {
+      Object.assign(task, { title, course: taskForm.value.course.trim() || "个人计划", dueAt: dueAt.toISOString(), reminderMinutes, remindDuringQuiet: taskForm.value.remindDuringQuiet, status: "todo" });
+      taskModalOpen.value = false;
+      editingTaskId.value = null;
+      checkDueTaskReminders();
+      showToast(TEXTS.tasks.updated);
+      return;
+    }
   }
   tasks.value.push({
     id: Math.max(0, ...tasks.value.map((task) => task.id)) + 1,
     title,
     course: taskForm.value.course.trim() || "个人计划",
-    dueAt: new Date(taskForm.value.dueAt).toISOString(),
-    reminderMinutes: taskForm.value.reminderMinutes,
+    dueAt: dueAt.toISOString(),
+    reminderMinutes,
     remindDuringQuiet: taskForm.value.remindDuringQuiet,
     status: "todo",
     createdAt: new Date().toISOString(),
   });
   taskModalOpen.value = false;
-  showToast("任务已添加");
+  checkDueTaskReminders();
+  showToast(TEXTS.tasks.added);
 }
 
 function checkDueReminders(): void {
   checkDueTaskReminders();
   checkDueCourseReminders();
+}
+
+function checkRemindersWhenVisible(): void {
+  if (document.visibilityState === "visible") checkDueReminders();
 }
 
 function checkDueTaskReminders(): void {
@@ -1138,12 +1371,12 @@ function checkDueTaskReminders(): void {
     const dueAt = new Date(task.dueAt).getTime();
     if (Number.isNaN(dueAt)) continue;
     const remindAt = dueAt - task.reminderMinutes * 60_000;
-    if (now < remindAt || now > remindAt + 90_000 || (!task.remindDuringQuiet && isQuietTime(new Date()))) continue;
+    if (now < remindAt || now > remindAt + 24 * 60 * 60_000) continue;
     const title = task.reminderMinutes === 0 ? "DDL 到期提醒" : "DDL 提前提醒";
     const body = `${task.title}（截止 ${formatDateTime(task.dueAt)}）`;
     if (notifications.value.some((item) => item.type === "task" && item.title === title && item.body === body)) continue;
     notifications.value.unshift({ id: Date.now(), title, body, createdAt: new Date().toISOString(), type: "task", read: false });
-    emitReminder(title, body);
+    if (task.remindDuringQuiet || !isQuietTime(new Date())) emitReminder(title, body);
   }
 }
 
@@ -1155,18 +1388,23 @@ function checkDueCourseReminders(): void {
     const [hour, minute] = course.startTime.split(":").map(Number);
     start.setHours(hour || 0, minute || 0, 0, 0);
     const remindAt = start.getTime() - course.reminderMinutes * 60_000;
-    if (now < remindAt || now > remindAt + 90_000 || isQuietTime(new Date())) continue;
+    if (now < remindAt || now > remindAt + 24 * 60 * 60_000) continue;
     const title = course.reminderMinutes === 0 ? "课程开始提醒" : "课程提前提醒";
     const body = `${course.name}（${formatDateTime(start.toISOString())}，${course.location}）`;
     if (notifications.value.some((item) => item.type === "course" && item.title === title && item.body === body)) continue;
     notifications.value.unshift({ id: Date.now(), title, body, createdAt: new Date().toISOString(), type: "course", read: false });
-    emitReminder(title, body);
+    if (!isQuietTime(new Date())) emitReminder(title, body);
   }
 }
 
 function emitReminder(title: string, body: string): void {
-  playReminderSound();
-  if (preferences.value.browserNotifications && typeof Notification !== "undefined" && Notification.permission === "granted") {
+  if (preferences.value.soundNotifications) playReminderSound();
+  if (!preferences.value.browserNotifications) return;
+  if (window.youxuebanRuntime?.notify) {
+    void window.youxuebanRuntime.notify(title, body);
+    return;
+  }
+  if (typeof Notification !== "undefined" && Notification.permission === "granted") {
     try {
       new Notification(title, { body, icon: "/favicon.ico" });
     } catch {
@@ -1203,6 +1441,10 @@ function playReminderSound(): void {
 
 async function handleBrowserNotificationsChange(): Promise<void> {
   if (!preferences.value.browserNotifications) return;
+  if (window.youxuebanRuntime?.notify) {
+    showToast("Windows通知已开启");
+    return;
+  }
   if (typeof Notification === "undefined") {
     preferences.value.browserNotifications = false;
     showToast("当前运行环境不支持 Windows 通知");
@@ -1234,21 +1476,40 @@ function isQuietTime(date: Date): boolean {
 }
 
 function toggleTask(task: StudyTask): void {
+  clearTaskDeleteConfirmation();
   task.status = task.status === "todo" ? "done" : "todo";
-  showToast(task.status === "done" ? "已完成，可随时撤销" : "任务已恢复");
+  showToast(task.status === "done" ? TEXTS.tasks.completed : TEXTS.tasks.restored);
+}
+
+function clearTaskDeleteConfirmation(): void {
+  deleteConfirmId.value = null;
+  if (deleteConfirmTimer !== undefined) {
+    window.clearTimeout(deleteConfirmTimer);
+    deleteConfirmTimer = undefined;
+  }
+}
+
+function handleAppClick(event: MouseEvent): void {
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || target.closest(".row-action.danger")) return;
+  // Any other button/action cancels an unconfirmed task deletion. This also
+  // restores the edit action immediately when the pointer remains over row.
+  if (deleteConfirmId.value !== null) clearTaskDeleteConfirmation();
 }
 
 function deleteTask(task: StudyTask): void {
   if (deleteConfirmId.value !== task.id) {
+    clearTaskDeleteConfirmation();
     deleteConfirmId.value = task.id;
-    window.setTimeout(() => {
+    deleteConfirmTimer = window.setTimeout(() => {
       if (deleteConfirmId.value === task.id) deleteConfirmId.value = null;
+      deleteConfirmTimer = undefined;
     }, 5000);
     return;
   }
   tasks.value = tasks.value.filter((item) => item.id !== task.id);
-  deleteConfirmId.value = null;
-  showToast("任务已删除");
+  clearTaskDeleteConfirmation();
+  showToast(TEXTS.tasks.deleted);
 }
 
 function courseGridPosition(course: Course): { gridColumn: string; gridRow: string } {
@@ -1266,6 +1527,7 @@ function openImport(): void {
   importPreview.value = [];
   importSelections.value = [];
   importError.value = "";
+  importMode.value = localSettings.value.campus.configured ? "mine" : "file";
   importStrategy.value = courses.value.length ? "replace" : "merge";
   courseImportOpen.value = true;
 }
@@ -1305,26 +1567,55 @@ async function loadImportPreview(): Promise<boolean> {
     }
     return importPreview.value.length > 0;
   }
-  if (!importClassId.value.trim()) {
-    importError.value = "请输入完整班级号";
-    return false;
+  if (importMode.value === "mine") {
+    if (!localSettings.value.campus.configured) {
+      importError.value = TEXTS.auth.campusRequired;
+      return false;
+    }
+    importBusy.value = true;
+    try {
+      const response = await apiFetch("/api/courses/mine", { method: "POST", body: "{}" });
+      const payload = await response.json() as { courses?: Array<Partial<ImportedCourse>>; error?: string };
+      if (!response.ok || !payload.courses) throw new Error(payload.error || TEXTS.auth.coursesQueryFailed);
+      setImportPreview(normalizeImportedCourses(payload.courses));
+      return true;
+    } catch (error) {
+      importError.value = error instanceof Error ? error.message : TEXTS.auth.coursesQueryFailed;
+      return false;
+    } finally {
+      importBusy.value = false;
+    }
   }
-  importBusy.value = true;
+  return false;
+}
+
+async function resetLocalCredentials(): Promise<void> {
+  // Native runtimes persist both sections in one encrypted document. Delete
+  // them serially so concurrent read/modify/write calls cannot resurrect one
+  // section with stale data.
+  for (const route of ["/api/local/settings/campus", "/api/local/settings/ai"]) {
+    try {
+      await apiFetch(route, { method: "DELETE" });
+    } catch {
+      // Continue clearing the remaining section and local UI state.
+    }
+  }
+}
+
+async function changeAssistantModel(event: Event): Promise<void> {
+  const model = (event.target as HTMLSelectElement).value;
+  if (!model || model === assistantRuntime.value?.model) return;
   try {
-    const response = await apiFetch("/api/courses/class", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ classId: importClassId.value.trim() }),
-    });
-    const payload = await response.json() as { courses?: Array<Partial<ImportedCourse>>; error?: string };
-    if (!response.ok || !payload.courses) throw new Error(payload.error || "班级课表查询失败");
-    setImportPreview(normalizeImportedCourses(payload.courses));
-    return true;
+    const response = await apiFetch("/api/local/settings/ai", { method: "POST", body: JSON.stringify({ model }) });
+    const payload = await response.json() as { model?: string; error?: string };
+    if (!response.ok) throw new Error(payload.error || TEXTS.ai.modelChangeFailed);
+    await refreshLocalSettings();
+    const config = await apiFetch("/api/config");
+    const configPayload = await config.json() as { assistant?: AssistantRuntimeInfo };
+    assistantRuntime.value = configPayload.assistant ?? assistantRuntime.value;
+    showToast(TEXTS.ai.switchedModel(model));
   } catch (error) {
-    importError.value = error instanceof Error ? error.message : "班级课表查询失败";
-    return false;
-  } finally {
-    importBusy.value = false;
+    showToast(error instanceof Error ? error.message : TEXTS.ai.modelChangeFailed);
   }
 }
 
@@ -1350,7 +1641,7 @@ async function advanceImport(): Promise<void> {
     else courses.value.push({ ...imported, id: nextId++, reminderMinutes: preferences.value.courseReminder, color: colorForCourse(imported.name, courses.value) });
   }
   courseImportOpen.value = false;
-  showToast(`课表导入完成，共写入 ${selectedCourses.length} 门课程`);
+  showToast(TEXTS.courses.importDone(selectedCourses.length));
 }
 
 function changeWeek(offset: number): void {
@@ -1407,14 +1698,14 @@ function createCourse(): void {
   const start = Number(courseForm.value.startSection);
   const end = Number(courseForm.value.endSection);
   if (!name || !Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 20) {
-    showToast("请检查课程名和节次");
+    showToast(TEXTS.validation.courseFields);
     return;
   }
   let weeks: string;
   try {
     weeks = normalizeWeeks(courseForm.value.weeks);
   } catch {
-    showToast("周次只支持数字、横杠和中英文逗号，例如 1-2，4-10");
+    showToast(TEXTS.validation.courseWeeks);
     return;
   }
   const id = Math.max(0, ...courses.value.map((course) => course.id)) + 1;
@@ -1432,7 +1723,7 @@ function createCourse(): void {
     ...courseTimes(start, end),
   });
   courseAddOpen.value = false;
-  showToast("课程已添加");
+  showToast(TEXTS.courses.added);
 }
 
 function startCourseEdit(): void {
@@ -1462,7 +1753,7 @@ function deleteSelectedCourse(): void {
   courseEditing.value = false;
   courseDeleteConfirming.value = false;
   if (courseDeleteConfirmTimer !== undefined) window.clearTimeout(courseDeleteConfirmTimer);
-  showToast("课程已删除");
+  showToast(TEXTS.courses.deleted);
 }
 
 function saveCourse(): void {
@@ -1471,14 +1762,14 @@ function saveCourse(): void {
   const start = Number(courseForm.value.startSection);
   const end = Number(courseForm.value.endSection);
   if (!name || !Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 20) {
-    showToast("请检查课程名和节次");
+    showToast(TEXTS.validation.courseFields);
     return;
   }
   let weeks: string;
   try {
     weeks = normalizeWeeks(courseForm.value.weeks);
   } catch {
-    showToast("周次只支持数字、横杠和中英文逗号，例如 1-2，4-10");
+    showToast(TEXTS.validation.courseWeeks);
     return;
   }
   const otherCourses = courses.value.filter((course) => course.id !== selectedCourse.value!.id);
@@ -1496,7 +1787,7 @@ function saveCourse(): void {
     ...courseTimes(start, end),
   });
   courseEditing.value = false;
-  showToast("课程修改已保存");
+  showToast(TEXTS.courses.saved);
 }
 
 async function openCampusItem(item: CampusItem): Promise<void> {
@@ -1512,18 +1803,13 @@ async function openCampusItem(item: CampusItem): Promise<void> {
       body: JSON.stringify({ id: item.id, title: item.title, url: item.url }),
     });
     const payload = await response.json() as { summary?: string; error?: string };
-    if (!response.ok || !payload.summary) throw new Error(payload.error || "AI 通知总结生成失败");
+    if (!response.ok || !payload.summary) throw new Error(payload.error || TEXTS.campus.summaryFailed);
     item.summary = payload.summary;
   } catch (error) {
-    campusSummaryError.value = error instanceof Error ? error.message : "AI 通知总结生成失败";
+    campusSummaryError.value = error instanceof Error ? error.message : TEXTS.campus.summaryUnavailable;
   } finally {
     campusSummaryBusy.value = false;
   }
-}
-
-function toggleCampusSubscription(item: CampusItem): void {
-  item.subscribed = !item.subscribed;
-  showToast(item.subscribed ? "已订阅，后续更新会通知你" : "已取消订阅");
 }
 
 async function saveElectricityBinding(): Promise<void> {
@@ -1552,7 +1838,7 @@ async function queryElectricity(silent = false, dormitoryOverride?: string, thro
     });
     const payload = await response.json() as (Partial<ElectricityResult> & { error?: string });
     if (!response.ok || typeof payload.balance !== "number" || !["元", "度"].includes(payload.unit ?? "") || !payload.updatedAt || !payload.queriedAt || !payload.sourceUrl) {
-      throw new Error(payload.error || "电费余额查询失败");
+      throw new Error(payload.error || TEXTS.electricity.queryFailed);
     }
     electricityResult.value = {
       dormitory: payload.dormitory || dormitory,
@@ -1563,10 +1849,10 @@ async function queryElectricity(silent = false, dormitoryOverride?: string, thro
       sourceUrl: payload.sourceUrl,
     };
     if (payload.balance < 10) addLowElectricityNotification(payload.balance, payload.unit as ElectricityResult["unit"], dormitory);
-    else if (!silent) showToast("电费余额已更新");
+    else if (!silent) showToast(TEXTS.electricity.updated);
     return electricityResult.value;
   } catch (error) {
-    electricityError.value = error instanceof Error ? error.message : "电费余额查询失败";
+    electricityError.value = error instanceof Error ? error.message : TEXTS.electricity.queryFailed;
     if (throwOnError) throw error;
     return null;
   } finally {
@@ -1576,7 +1862,7 @@ async function queryElectricity(silent = false, dormitoryOverride?: string, thro
 
 function addLowElectricityNotification(balance: number, unit: ElectricityResult["unit"], dormitory = electricityDormitory.value): void {
   const today = new Date().toISOString().slice(0, 10);
-  const body = `${dormitory} 当前${unit === "元" ? "余额" : "剩余电量"} ${balance.toFixed(2)} ${unit}，请及时充值。`;
+  const body = `${dormitory} 当前${unit === "元" ? "余额" : "剩余电量"} ${balance.toFixed(2)} ${unit}，请及时充值`;
   const notificationTitle = unit === "元" ? "电费余额不足" : "剩余电量不足";
   const alreadyAdded = notifications.value.some((item) => item.title === notificationTitle
     && item.body.startsWith(`${dormitory} `)
@@ -1594,26 +1880,29 @@ function addLowElectricityNotification(balance: number, unit: ElectricityResult[
   showToast(`${notificationTitle} 10 ${unit}，已加入消息提醒`);
 }
 
-function editElectricityBinding(): void {
-  electricityDormitoryDraft.value = electricityDormitory.value;
-  electricityEditing.value = true;
+function unbindElectricity(): void {
+  electricityDormitory.value = "";
+  electricityDormitoryDraft.value = "";
+  electricityResult.value = null;
   electricityError.value = "";
+  electricityEditing.value = true;
+  showToast(TEXTS.electricity.unbound);
 }
 
-async function loadCampusData(): Promise<void> {
+async function loadCampusData(relogin = false): Promise<void> {
   if (campusBusy.value) return;
   campusBusy.value = true;
   campusError.value = "";
   try {
-    const response = await apiFetch("/api/campus");
+    const response = await apiFetch(relogin ? "/api/campus/relogin" : "/api/campus", relogin ? { method: "POST" } : undefined);
     const payload = await response.json() as { items?: CampusItem[]; errors?: string[]; statuses?: CampusSourceStatus[]; updatedAt?: string; error?: string };
     campusStatuses.value = payload.statuses ?? [];
-    if (!payload.items) throw new Error(payload.error || "校园数据加载失败");
+    if (!payload.items) throw new Error(payload.error || TEXTS.common.campusLoadFailed);
     const localState = new Map(campusItems.value.map((item) => [`${item.kind}:${item.id}`, item]));
     const readableItems = payload.items.filter(isCampusItemReadable);
     campusItems.value = readableItems.map((item) => {
       const previous = localState.get(`${item.kind}:${item.id}`);
-      return { ...item, read: previous?.read ?? false, subscribed: previous?.subscribed ?? false };
+      return { ...item, read: previous?.read ?? false };
     });
     portalVisibleCount.value = 10;
     campusUpdatedAt.value = payload.updatedAt ?? new Date().toISOString();
@@ -1621,15 +1910,32 @@ async function loadCampusData(): Promise<void> {
     campusError.value = [...(payload.errors ?? []), ...(payload.error && !(payload.errors ?? []).includes(payload.error) ? [payload.error] : []), ...(dropped ? [`已忽略 ${dropped} 条编码异常的旧缓存`] : [])].join("；");
   } catch (error) {
     campusError.value = error instanceof Error ? error.message : "校园数据加载失败";
-    campusStatuses.value = [];
+    if (campusItems.value.length) {
+      const counts = new Map<CampusKind, number>();
+      for (const item of campusItems.value) counts.set(item.kind, (counts.get(item.kind) ?? 0) + 1);
+      campusStatuses.value = ([
+        ["notice", "信息门户"],
+        ["activity", "第二课堂"],
+      ] as const).map(([source, label]) => ({
+        source: source === "notice" ? "portal" : source,
+        label,
+        mode: "cache" as const,
+        message: `${TEXTS.campus.cacheNotice}（${counts.get(source) ?? 0} 条）`,
+        itemCount: counts.get(source) ?? 0,
+      }));
+    } else campusStatuses.value = [];
   } finally {
     campusBusy.value = false;
   }
 }
 
+async function reloginCampus(): Promise<void> {
+  await loadCampusData(true);
+}
+
 function newAssistantConversation(): void {
   if (activeConversationIsBlank.value) {
-    showToast("当前已是空白对话，请先发送一条消息");
+    showToast(TEXTS.common.blankConversation);
     return;
   }
   const conversation = assistantConversations.value.find(isAssistantConversationBlank) ?? createAssistantConversation();
@@ -1727,16 +2033,16 @@ async function selectAssistantFiles(event: Event): Promise<void> {
       break;
     }
     if (!allowed.includes(file.type)) {
-      showToast("当前模型仅支持 PNG、JPG 和 WebP 图片");
+      showToast(TEXTS.validation.imageType);
       continue;
     }
     if (file.size > MAX_ASSISTANT_FILE_SIZE) {
-      showToast("单张图片不能超过 1 MB");
+      showToast(TEXTS.validation.imageTooLarge);
       continue;
     }
     const dataUrl = await fileToDataUrl(file);
     if (!isImageDataUrl(dataUrl)) {
-      showToast("无法读取这张图片");
+      showToast(TEXTS.validation.imageReadFailed);
       continue;
     }
     assistantAttachments.value.push({
@@ -1759,7 +2065,7 @@ function nextSuggestion(): void {
 
 function markAllNotificationsRead(): void {
   notifications.value.forEach((item) => { item.read = true; });
-  showToast("通知已全部标记为已读");
+  showToast(TEXTS.common.notificationsRead);
 }
 
 function formatReminder(minutes: number | null): string {
@@ -1769,11 +2075,15 @@ function formatReminder(minutes: number | null): string {
 }
 
 async function sendAssistant(prompt = assistantInput.value): Promise<void> {
+  if (!localSettings.value.ai.configured || !assistantRuntime.value?.model) {
+    openAiConfig();
+    return;
+  }
   const text = prompt.trim();
   if ((!text && !assistantAttachments.value.length) || assistantBusy.value) return;
   const attachments = assistantAttachments.value.map((item) => ({ ...item }));
   const conversation = activeConversation.value;
-  const addedTokens = estimateAssistantMessageTokens(text || "请分析这张图片。", attachments);
+  const addedTokens = estimateAssistantMessageTokens(text || "请分析这张图片", attachments);
   const projectedTokens = assistantContextBaseTokens.value + addedTokens;
   if (assistantContextThreshold.value > 0 && projectedTokens >= assistantContextThreshold.value) {
     assistantError.value = "上下文已满，请新建对话后继续";
@@ -1783,7 +2093,7 @@ async function sendAssistant(prompt = assistantInput.value): Promise<void> {
   assistantInput.value = "";
   const needsGeneratedTitle = conversation.title === "新对话" && !conversation.messages.some((message) => message.role === "user");
   assistantAttachments.value = [];
-  assistantMessages.value.push({ id: Date.now(), role: "user", content: text || "请分析这张图片。", createdAt: new Date().toISOString(), ...(attachments.length ? { attachments } : {}) });
+  assistantMessages.value.push({ id: Date.now(), role: "user", content: text || "请分析这张图片", createdAt: new Date().toISOString(), ...(attachments.length ? { attachments } : {}) });
   const previousUsage = normalizeAssistantTokenUsage(conversation.tokenUsage);
   conversation.tokenUsage = {
     inputTokens: (previousUsage?.inputTokens ?? assistantContextBaseTokens.value) + addedTokens,
@@ -1819,9 +2129,9 @@ async function sendAssistant(prompt = assistantInput.value): Promise<void> {
         protocolMessages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(toolResult, ensureJsonReplacer) });
       }
     }
-    if (result.toolCalls?.length) throw new Error("工具调用轮数超过限制，请把操作拆成两步重试");
+    if (result.toolCalls?.length) throw new Error(TEXTS.ai.toolLimit);
     const reply = result.reply?.trim();
-    if (!reply) throw new Error("AI 服务没有返回正文");
+    if (!reply) throw new Error(TEXTS.ai.noReply);
     conversation.messages.push({ id: Date.now() + 1, role: "assistant", content: reply, createdAt: new Date().toISOString() });
     conversation.updatedAt = new Date().toISOString();
     assistantMode.value = "online";
@@ -1830,14 +2140,14 @@ async function sendAssistant(prompt = assistantInput.value): Promise<void> {
     if (error instanceof AssistantCompletionError && error.usage) {
       conversation.tokenUsage = normalizeAssistantTokenUsage(error.usage);
     }
-    assistantError.value = error instanceof Error ? error.message : "AI 服务暂时不可用";
+    assistantError.value = error instanceof Error ? error.message : TEXTS.ai.unavailable;
     if (assistantError.value.includes("上下文已满")) {
       assistantMode.value = "unknown";
       showToast(assistantError.value);
       return;
     }
     assistantMode.value = "error";
-    const failureMessage = `暂时无法连接在线 AI：${assistantError.value}。请稍后重试。`;
+    const failureMessage = `暂时无法连接在线 AI：${assistantError.value}请稍后重试`;
     assistantMessages.value.push({ id: Date.now() + 1, role: "assistant", content: failureMessage, createdAt: new Date().toISOString() });
     const usage = normalizeAssistantTokenUsage(conversation.tokenUsage);
     if (usage) conversation.tokenUsage = { ...usage, totalTokens: usage.totalTokens + estimateAssistantTextTokens(failureMessage), estimated: true };
@@ -1852,7 +2162,7 @@ function assistantToolLabel(name: string): string {
   const labels: Record<string, string> = {
     course_list: "正在查询课表…", course_edit: "正在更新课程…", course_add: "正在添加课程…",
     ddl_list: "正在查询 DDL…", ddl_show: "正在读取 DDL…", ddl_add: "正在添加 DDL…", ddl_edit: "正在编辑 DDL…",
-    ddl_remind: "正在设置提醒…", ddl_done: "正在更新 DDL 状态…", campus_query: "正在查询校园通知…", electricity_query: "正在查询电费…",
+    ddl_remind: "正在设置提醒…", ddl_done: "正在更新 DDL 状态…", ddl_delete: "正在删除 DDL…", campus_query: "正在查询校园通知…", electricity_query: "正在查询电费…",
   };
   return labels[name] ?? "正在执行操作…";
 }
@@ -1863,7 +2173,7 @@ function assistantContext(): Record<string, unknown> {
   if (preferences.value.analyticsEnabled) {
     Object.assign(context, {
       courses: courses.value.map(({ id, name, weekday, startSection, endSection, location, teacher, weeks, reminderMinutes }) => ({ id, name, weekday, startSection, endSection, location, teacher, weeks, reminderMinutes })),
-      tasks: todoTasks.value.map(({ id, title, course, dueAt, reminderMinutes }) => ({ id, title, course, dueAt, reminderMinutes })),
+      tasks: todoTasks.value.map(({ id, title, course, dueAt, reminderMinutes, remindDuringQuiet }) => ({ id, title, course, dueAt, reminderMinutes, remindDuringQuiet })),
       campus: campusItems.value.slice(0, 50).map(({ id, kind, category, title, summary, publishedAt, campus, eventTime, read }) => ({ id, kind, category, title, summary, publishedAt, campus, eventTime, read })),
       notifications: notifications.value.slice(0, 50),
       electricity: electricityResult.value,
@@ -1885,7 +2195,7 @@ async function requestAssistantCompletion(messages: Array<Record<string, unknown
     }),
   });
   const payload = await response.json() as AssistantToolResponse;
-  if (!response.ok) throw new AssistantCompletionError(payload.error || "AI 服务暂时不可用", payload.usage);
+  if (!response.ok) throw new AssistantCompletionError(payload.error || TEXTS.ai.unavailable, payload.usage);
   return payload;
 }
 
@@ -1963,8 +2273,9 @@ async function executeAssistantTool(name: string, args: Record<string, unknown>)
       const requestedReminder = !hasReminder ? preferences.value.defaultTaskReminder : args.reminder_minutes == null ? null : Number(args.reminder_minutes);
       const reminderMinutes = !hasReminder && new Date(dueAt).getTime() - Date.now() <= preferences.value.defaultTaskReminder * 60_000 ? 0 : requestedReminder;
       const normalizedReminder = reminderMinutes == null ? null : Number.isFinite(reminderMinutes) ? Math.max(0, Math.min(10080, reminderMinutes)) : 0;
-      const task: StudyTask = { id: Math.max(0, ...tasks.value.map((item) => item.id)) + 1, title, course: "个人计划", dueAt, reminderMinutes: normalizedReminder, remindDuringQuiet: false, status: "todo", createdAt: new Date().toISOString() };
+      const task: StudyTask = { id: Math.max(0, ...tasks.value.map((item) => item.id)) + 1, title, course: "个人计划", dueAt, reminderMinutes: normalizedReminder, remindDuringQuiet: args.remind_during_quiet === true, status: "todo", createdAt: new Date().toISOString() };
       tasks.value.push(task);
+      checkDueTaskReminders();
       return { success: true, ddl: { ...task } };
     }
     if (name === "ddl_edit") {
@@ -1978,12 +2289,15 @@ async function executeAssistantTool(name: string, args: Record<string, unknown>)
       }
       if (args.content != null) task.title = String(args.content).trim();
       if (args.reminder_minutes !== undefined) task.reminderMinutes = args.reminder_minutes == null ? null : Math.max(0, Math.min(10080, Number(args.reminder_minutes)));
+      if (args.remind_during_quiet !== undefined) task.remindDuringQuiet = args.remind_during_quiet === true;
+      checkDueTaskReminders();
       return { success: true, ddl: { ...task } };
     }
     if (name === "ddl_remind") {
       const task = tasks.value.find((item) => item.id === Number(args.ddl_id) && item.status === "todo");
       if (!task) return { success: false, error: "DDL 不存在或已完成" };
       task.reminderMinutes = args.reminder_minutes == null ? null : Math.max(0, Math.min(10080, Number(args.reminder_minutes)));
+      if (args.remind_during_quiet !== undefined) task.remindDuringQuiet = args.remind_during_quiet === true;
       return { success: true, ddl: { ...task } };
     }
     if (name === "ddl_done") {
@@ -1991,6 +2305,13 @@ async function executeAssistantTool(name: string, args: Record<string, unknown>)
       if (!task) return { success: false, error: "DDL 不存在" };
       task.status = "done";
       return { success: true, ddl: { ...task } };
+    }
+    if (name === "ddl_delete") {
+      const id = Number(args.ddl_id);
+      const index = tasks.value.findIndex((item) => item.id === id);
+      if (index < 0) return { success: false, error: "DDL 不存在" };
+      tasks.value.splice(index, 1);
+      return { success: true, ddl_id: id };
     }
     if (name === "campus_query") {
       await loadCampusData();
@@ -2077,77 +2398,14 @@ function runAssistantAction(message: AssistantMessage): void {
       createdAt: new Date().toISOString(),
     });
     action.completed = true;
-    showToast("任务已由助手添加");
+    showToast(TEXTS.tasks.assistantAdded);
   }
 }
 
-async function logoutAccount(): Promise<void> {
-  if (accountLogoutBusy.value) return;
-  accountLogoutBusy.value = true;
-  try {
-    await logoutSession();
-  } finally {
-    try {
-      await clearSavedLogin();
-    } catch {
-      // The server session is already closed; continue to the login screen even if local cleanup fails.
-    }
-    sessionStorage.removeItem("youxueban-auth-user");
-    window.location.reload();
-  }
-}
-
-async function changePassword(): Promise<void> {
-  if (passwordChangeBusy.value) return;
-  passwordChangeError.value = "";
-  const { currentPassword, newPassword, confirmPassword } = passwordChangeForm.value;
-  if (currentPassword.length < 6) {
-    passwordChangeError.value = "请输入原密码。";
-    return;
-  }
-  if (newPassword.length < 6 || newPassword.length > 128) {
-    passwordChangeError.value = "新密码长度应为 6 到 128 个字符。";
-    return;
-  }
-  if (newPassword !== confirmPassword) {
-    passwordChangeError.value = "两次输入的新密码不一致。";
-    return;
-  }
-  if (newPassword === currentPassword) {
-    passwordChangeError.value = "新密码不能与原密码相同。";
-    return;
-  }
-  passwordChangeBusy.value = true;
-  try {
-    const response = await apiFetch("/api/v1/auth/password", {
-      method: "POST",
-      body: JSON.stringify({ currentPassword, newPassword, confirmPassword }),
-    });
-    const payload = await response.json().catch(() => ({})) as { error?: string };
-    if (!response.ok) {
-      passwordChangeError.value = payload.error || "修改密码失败，请稍后重试。";
-      return;
-    }
-    passwordChangeOpen.value = false;
-    passwordChangeForm.value = { currentPassword: "", newPassword: "", confirmPassword: "" };
-    setAccessToken("");
-    try {
-      await clearSavedLogin();
-    } catch {
-      // The server session is already invalidated; continue to the login screen.
-    }
-    sessionStorage.removeItem("youxueban-auth-user");
-    window.location.reload();
-  } catch {
-    passwordChangeError.value = "无法连接邮学伴服务端，请稍后重试。";
-  } finally {
-    passwordChangeBusy.value = false;
-  }
-}
 </script>
 
 <template>
-  <div class="app-shell" :style="{ '--sidebar-width': `${sidebarWidth}px` }">
+  <div class="app-shell" :style="{ '--sidebar-width': `${sidebarWidth}px` }" @click="handleAppClick">
     <aside ref="sidebarRef" class="sidebar">
       <span class="sidebar-nav-glider" :class="{ ready: sidebarGliderReady }" :style="sidebarGliderStyle" aria-hidden="true" />
       <button class="brand" type="button" aria-label="返回今天" @click="navigate('today')">
@@ -2161,7 +2419,7 @@ async function changePassword(): Promise<void> {
       </nav>
       <div class="sidebar-spacer" />
       <div class="sidebar-footer">
-        <div class="profile-button sidebar-profile"><span class="avatar"><img v-if="profileAvatar" :src="profileAvatar" alt="" /><template v-else>{{ profileInitial }}</template></span><span class="profile-text">{{ profileName }}<small>北邮学生</small></span></div>
+        <div class="sidebar-profile-row"><div class="profile-button sidebar-profile"><span class="avatar"><img v-if="profileAvatar" :src="profileAvatar" alt="" /><template v-else>{{ profileInitial }}</template></span><span class="profile-text">{{ profileName }}<small>北邮学生</small></span></div></div>
         <div class="sidebar-footer-actions">
           <button class="sidebar-status" type="button" :class="{ active: currentPage === 'notifications' }" :aria-current="currentPage === 'notifications' ? 'page' : undefined" @click="navigate('notifications')"><IconGlyph name="bell" /><span><strong>消息</strong><small>{{ unreadCount ? `${unreadCount} 条未读` : '暂无未读' }}</small></span></button>
           <button class="sidebar-settings" type="button" :class="{ active: currentPage === 'settings' }" :aria-current="currentPage === 'settings' ? 'page' : undefined" @click="navigate('settings')"><IconGlyph name="settings" /><span>设置</span></button>
@@ -2174,7 +2432,7 @@ async function changePassword(): Promise<void> {
       <main class="page-container">
         <Transition name="page-view" mode="out-in" appear>
         <section v-if="currentPage === 'today'" class="page page-today">
-          <header class="page-heading today-heading"><div><span class="eyebrow">BUPT · 第 {{ currentAcademicWeek }} 周</span><h1>{{ greeting }}，{{ profileName || '同学' }}。</h1><p>把课程、任务和校园消息，收进今天的节奏里。</p></div><time class="today-clock"><strong>{{ timeHeading }}</strong><span>{{ dateHeading }}</span></time></header>
+          <header class="page-heading today-heading"><div><span class="eyebrow">BUPT · 第 {{ currentAcademicWeek }} 周</span><h1>{{ greeting }}，{{ profileName || '同学' }}</h1><p>{{ TEXTS.pages.todayDescription }}</p></div><time class="today-clock"><strong>{{ timeHeading }}</strong><span>{{ dateHeading }}</span></time></header>
           <div class="today-layout">
             <div class="content-stack">
               <article class="surface course-overview">
@@ -2184,7 +2442,7 @@ async function changePassword(): Promise<void> {
                   <div class="next-course-main"><strong>{{ nextCourse.name }}</strong><span>{{ nextCourse.location }} · {{ nextCourse.teacher }}</span></div>
                   <span class="countdown">{{ currentCourse ? `正在上课 · ${nextCourse.endTime} 下课` : '稍后开始' }}</span>
                 </div>
-                <div v-else class="empty-state compact"><IconGlyph name="courses" /><strong>今天没有后续课程</strong><span>可以继续处理任务或安排复习。</span></div>
+                <div v-else class="empty-state compact"><IconGlyph name="courses" /><strong>今天没有后续课程</strong><span>可以继续处理任务或安排复习</span></div>
                 <div class="day-timeline">
                   <div v-for="course in todayCourses" :key="course.id" class="timeline-row">
                     <time>{{ course.startTime }}</time><span class="timeline-line" /><button type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><small>{{ course.location }} · {{ course.endTime }} 下课</small></button>
@@ -2199,14 +2457,14 @@ async function changePassword(): Promise<void> {
                     <button class="task-summary" type="button" @click="navigate('tasks')"><strong>{{ task.title }}</strong><small>{{ task.course }} · {{ formatReminder(task.reminderMinutes) }}</small></button>
                     <time :class="{ overdue: new Date(task.dueAt).getTime() < Date.now() }">{{ relativeDue(task.dueAt) }}</time>
                   </div>
-                  <div v-if="!todoTasks.length" class="empty-state compact"><IconGlyph name="tasks" /><strong>今天没有待办</strong><span>可以安心安排学习或休息。</span></div>
+                  <div v-if="!todoTasks.length" class="empty-state compact"><IconGlyph name="tasks" /><strong>今天没有待办</strong><span>可以安心安排学习或休息</span></div>
                 </div>
               </article>
             </div>
             <div class="content-stack side-column">
               <article class="surface">
                 <div class="surface-heading"><h2>校园动态</h2><button class="text-button" type="button" @click="navigate('campus')">进入校园 <IconGlyph name="arrow-right" :size="15" /></button></div>
-                <button v-for="item in campusItems.slice(0, 3)" :key="item.id" class="news-row" type="button" @click="openCampusItem(item)"><span v-if="!item.read" class="unread-dot" /><strong>{{ item.title }}</strong><small>{{ item.source }} · {{ formatDateTime(item.publishedAt) }}</small></button>
+                <button v-for="item in todayCampusItems" :key="item.id" class="news-row" type="button" @click="openCampusItem(item)"><span v-if="!item.read" class="unread-dot" /><strong>{{ item.title }}</strong><small>{{ item.source }} · {{ formatDateTime(item.publishedAt) }}</small></button>
               </article>
               <article class="surface suggestion-card"><div class="surface-heading"><h2>现在做什么</h2><span>结合当前安排推荐</span></div><p>{{ currentSuggestion }}</p><button class="text-button" type="button" @click="nextSuggestion">换一个建议</button></article>
             </div>
@@ -2215,21 +2473,21 @@ async function changePassword(): Promise<void> {
         </section>
 
         <section v-else-if="currentPage === 'tasks'" class="page">
-          <header class="page-heading split"><div><span class="eyebrow">个人事务</span><h1>任务与 DDL</h1><p>按截止时间安排，不让重要事项被聊天记录淹没。</p></div><button class="primary-button" type="button" @click="openTaskModal()"><IconGlyph name="plus" />添加任务</button></header>
+          <header class="page-heading split"><div><span class="eyebrow">个人事务</span><h1>任务与 DDL</h1><p>{{ TEXTS.pages.tasksDescription }}</p></div><button class="primary-button" type="button" @click="openTaskModal()"><IconGlyph name="plus" />添加任务</button></header>
           <div class="toolbar"><div class="segmented"><button v-for="filter in [{id:'todo',label:`待完成 ${todoTasks.length}`},{id:'all',label:`全部 ${tasks.length}`},{id:'done',label:`已完成 ${tasks.filter(t=>t.status==='done').length}`} ]" :key="filter.id" type="button" :class="{ active: taskFilter === filter.id }" @click="taskFilter = filter.id as typeof taskFilter">{{ filter.label }}</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="taskSearch" placeholder="搜索任务或课程" /></label></div>
           <div class="task-list surface">
             <article v-for="task in filteredTasks" :key="task.id" class="task-row" :class="{ completed: task.status === 'done' }">
               <button class="task-check" :class="{ checked: task.status === 'done' }" type="button" :aria-label="task.status === 'done' ? '恢复任务' : '完成任务'" @click="toggleTask(task)"><IconGlyph name="check" :size="14" /></button>
               <div class="task-body"><strong>{{ task.title }}</strong><span><b>{{ task.course }}</b><span class="dot-separator">·</span><IconGlyph name="bell" :size="13" /> {{ formatReminder(task.reminderMinutes) }}<template v-if="task.remindDuringQuiet"><span class="dot-separator">·</span>静默时段仍提醒</template></span></div>
               <div class="task-due"><span :class="{ overdue: new Date(task.dueAt).getTime() < Date.now() && task.status === 'todo' }">{{ formatDateTime(task.dueAt) }}</span><small>{{ task.status === 'done' ? '已完成' : relativeDue(task.dueAt) }}</small></div>
-              <button class="row-action danger" :class="{ confirming: deleteConfirmId === task.id }" type="button" :aria-label="deleteConfirmId === task.id ? '确认删除任务' : '删除任务'" @click="deleteTask(task)"><span v-if="deleteConfirmId === task.id">确认删除</span><IconGlyph v-else name="trash" /></button>
+              <button v-if="task.status === 'todo'" class="row-action" type="button" aria-label="编辑任务" @click="openTaskEdit(task)"><IconGlyph name="edit" /></button><button class="row-action danger" :class="{ confirming: deleteConfirmId === task.id }" type="button" :aria-label="deleteConfirmId === task.id ? '确认删除任务' : '删除任务'" @click="deleteTask(task)"><span v-if="deleteConfirmId === task.id">{{ TEXTS.tasks.confirmDelete }}</span><IconGlyph v-else name="trash" /></button>
             </article>
-            <div v-if="!filteredTasks.length" class="empty-state"><IconGlyph name="search" :size="28" /><strong>没有找到任务</strong><span>换个关键词，或新建一项任务。</span></div>
+            <div v-if="!filteredTasks.length" class="empty-state"><IconGlyph name="search" :size="28" /><strong>没有找到任务</strong><span>换个关键词，或新建一项任务</span></div>
           </div>
         </section>
 
         <section v-else-if="currentPage === 'courses'" class="page">
-          <header class="page-heading split"><div><span class="eyebrow">当前是第 {{ currentAcademicWeek }} 周</span><h1>第 <input class="week-number-input" type="text" inputmode="numeric" pattern="[0-9]*" :value="selectedWeek" aria-label="查看第几周课程" @blur="updateSelectedWeek" @keydown.enter.prevent="finishSelectedWeekInput" /> 周课程</h1><p>点击课程查看周次、地点、教师和提醒设置。</p></div><button class="primary-button" type="button" @click="openImport"><IconGlyph name="upload" />导入课表</button></header>
+          <header class="page-heading split"><div><span class="eyebrow">当前是第 {{ currentAcademicWeek }} 周</span><h1>第 <input class="week-number-input" type="text" inputmode="numeric" pattern="[0-9]*" :value="selectedWeek" aria-label="查看第几周课程" @blur="updateSelectedWeek" @keydown.enter.prevent="finishSelectedWeekInput" /> 周课程</h1><p>点击课程查看周次、地点、教师和提醒设置</p></div><button class="primary-button" type="button" @click="openImport"><IconGlyph name="upload" />导入课表</button></header>
           <div class="toolbar course-toolbar"><div class="week-switcher"><button class="icon-button" type="button" aria-label="上一周" :disabled="selectedWeek <= 1" @click="changeWeek(-1)"><IconGlyph name="chevron-left" /></button><button class="secondary-button active week-current-button" type="button" @click="goToCurrentWeek">{{ selectedWeek === currentAcademicWeek ? '本周' : `返回第 ${currentAcademicWeek} 周` }}</button><button class="icon-button" type="button" aria-label="下一周" :disabled="selectedWeek >= MAX_ACADEMIC_WEEK" @click="changeWeek(1)"><IconGlyph name="chevron-right" /></button></div><span class="sync-status"><span class="status-dot" />第 {{ selectedWeek }} 周</span></div>
           <div class="schedule-wrap surface">
             <div class="schedule-grid">
@@ -2241,35 +2499,35 @@ async function changePassword(): Promise<void> {
               <button v-for="course in visibleCourses" :key="course.id" class="course-cell" :class="[`course-${course.color}`, { compact: course.endSection === course.startSection }]" :style="courseGridPosition(course)" type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><span>{{ course.location }}</span><small>{{ course.teacher }}</small></button>
             </div>
           </div>
-          <div class="mobile-course-list surface"><article v-for="course in visibleCourses" :key="course.id"><time>{{ weekdays[course.weekday - 1] ?? `周${course.weekday}` }}<br>{{ formatWeekDate(weekDates[course.weekday - 1]!.date) }} · {{ course.startTime }}–{{ course.endTime }}</time><span :class="`course-marker course-${course.color}`" /><button type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><small>第 {{ course.startSection }}–{{ course.endSection }} 节 · {{ course.location }} · {{ course.teacher }}</small></button></article><div v-if="!visibleCourses.length" class="empty-state compact"><strong>这一周没有课程</strong><span>仍可使用上方按钮继续切换周次，或导入你的真实课表。</span></div></div>
+          <div class="mobile-course-list surface"><article v-for="course in visibleCourses" :key="course.id"><time>{{ weekdays[course.weekday - 1] ?? `周${course.weekday}` }}<br>{{ formatWeekDate(weekDates[course.weekday - 1]!.date) }} · {{ course.startTime }}–{{ course.endTime }}</time><span :class="`course-marker course-${course.color}`" /><button type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><small>第 {{ course.startSection }}–{{ course.endSection }} 节 · {{ course.location }} · {{ course.teacher }}</small></button></article><div v-if="!visibleCourses.length" class="empty-state compact"><strong>这一周没有课程</strong><span>仍可使用上方按钮继续切换周次，或导入你的真实课表</span></div></div>
         </section>
 
         <section v-else-if="currentPage === 'campus'" class="page">
-          <header class="page-heading split"><div><span class="eyebrow">真实校园服务</span><h1>校园</h1><p>只读查询信息门户通知与第二课堂活动。<span v-if="campusUpdatedAt">上次刷新：{{ formatDateTime(campusUpdatedAt) }}</span></p></div><button class="secondary-button" type="button" :disabled="campusBusy" @click="loadCampusData"><IconGlyph name="refresh" />{{ campusBusy ? '正在刷新' : '刷新' }}</button></header>
+          <header class="page-heading split"><div><span class="eyebrow">{{ TEXTS.pages.campusEyebrow }}</span><h1>校园</h1><p>只读查询信息门户通知与第二课堂活动<span v-if="campusUpdatedAt">，上次刷新：{{ formatDateTime(campusUpdatedAt) }}</span></p></div><button class="secondary-button" type="button" :disabled="campusBusy" @click="loadCampusData()"><IconGlyph name="refresh" />{{ campusBusy ? '正在刷新' : '刷新' }}</button></header>
           <nav class="campus-service-links" aria-label="北邮校园系统快捷入口"><a v-for="service in campusServices" :key="service.name" :href="service.url" target="_blank" rel="noopener noreferrer"><span><strong>{{ service.name }}</strong><small>{{ service.description }}</small></span><IconGlyph name="external" :size="17" /></a></nav>
           <div v-if="campusStatuses.length" class="campus-statuses" aria-label="校园数据来源状态"><span v-for="status in campusStatuses" :key="status.source" :class="`mode-${status.mode}`"><i /> <strong>{{ status.label }}</strong>{{ status.message }}</span></div>
           <div class="toolbar"><div class="segmented"><button type="button" :class="{ active: campusTab === 'notice' }" @click="campusTab = 'notice'">信息门户</button><button type="button" :class="{ active: campusTab === 'activity' }" @click="campusTab = 'activity'">第二课堂</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="campusSearch" placeholder="搜索标题、类别或内容" /></label></div>
-          <p v-if="campusError" class="service-warning" role="status">{{ campusError }}<span v-if="campusItems.length">已保留成功读取的数据。</span></p>
+          <p v-if="campusError" class="service-warning" role="status"><span>{{ campusError }}<template v-if="campusItems.length">已保留成功读取的数据</template></span><button v-if="campusNeedsRelogin" class="secondary-button" type="button" :disabled="campusBusy" @click="reloginCampus">重新登录（可能会短暂打开浏览器）</button></p>
           <div class="campus-grid">
             <article v-for="item in filteredCampusItems" :key="item.id" class="campus-card surface" :class="{ unread: !item.read }">
-              <div class="campus-card-top"><span class="category-chip">{{ item.category }}</span><button class="subscribe-button" :class="{ subscribed: item.subscribed }" type="button" @click="toggleCampusSubscription(item)">{{ item.subscribed ? '已订阅' : '订阅' }}</button></div>
-              <button class="campus-content" type="button" @click="openCampusItem(item)"><strong>{{ item.title }}</strong><p>{{ item.summary || (item.kind === 'notice' ? '点击生成 AI 通知总结。' : '点击查看活动详情。') }}</p><span v-if="item.campus"><IconGlyph name="map" :size="14" />{{ item.campus }}</span><span v-if="item.eventTime"><IconGlyph name="clock" :size="14" />{{ formatDateTime(item.eventTime) }}</span></button>
+              <div class="campus-card-top"><span class="category-chip">{{ item.category }}</span></div>
+              <button class="campus-content" type="button" @click="openCampusItem(item)"><strong>{{ item.title }}</strong><p>{{ item.summary || (item.kind === 'notice' ? '点击生成 AI 通知总结' : '点击查看活动详情') }}</p><span v-if="item.campus"><IconGlyph name="map" :size="14" />{{ item.campus }}</span><span v-if="item.eventTime"><IconGlyph name="clock" :size="14" />{{ formatDateTime(item.eventTime) }}</span></button>
               <footer><span>{{ item.source }}</span><time>{{ formatDateTime(item.publishedAt) }}</time></footer>
             </article>
           </div>
-          <div v-if="campusBusy && !campusItems.length" class="empty-state surface"><IconGlyph name="refresh" :size="28" /><strong>正在读取官方服务</strong><span>信息门户与第二课堂会分别返回状态。</span></div>
-          <div v-else-if="!filteredCampusItems.length" class="empty-state surface"><IconGlyph :name="activityIsEmptyOnline ? 'campus' : 'search'" :size="28" /><strong>{{ activityIsEmptyOnline ? '当前暂无活动' : campusError ? '当前来源没有可显示的数据' : '没有匹配的信息' }}</strong><span>{{ activityIsEmptyOnline ? '第二课堂当前没有进行中的活动。' : campusError ? '请根据上方提示更新会话或稍后重试。' : '尝试缩短关键词或切换栏目。' }}</span></div>
-          <div v-if="campusTab === 'notice' && !campusSearch.trim() && portalItemCount" class="campus-load-more"><button v-if="canLoadMorePortalItems" class="secondary-button" type="button" @click="portalVisibleCount = Math.min(50, portalVisibleCount + 10)">获取更多通知</button><a v-else class="secondary-button" href="http://my.bupt.edu.cn/" target="_blank" rel="noopener noreferrer">请前往官网查看更多通知</a></div>
+          <div v-if="campusBusy && !campusItems.length" class="empty-state surface"><IconGlyph name="refresh" :size="28" /><strong>正在读取官方服务</strong><span>信息门户与第二课堂会分别返回状态</span></div>
+          <div v-else-if="!filteredCampusItems.length" class="empty-state surface"><IconGlyph :name="activityIsEmptyOnline ? 'campus' : 'search'" :size="28" /><strong>{{ activityIsEmptyOnline ? '当前暂无活动' : campusError ? '当前来源没有可显示的数据' : '没有匹配的信息' }}</strong><span>{{ activityIsEmptyOnline ? '第二课堂当前没有进行中的活动' : campusError ? '请根据上方提示更新会话或稍后重试' : '尝试缩短关键词或切换栏目' }}</span></div>
+          <div v-if="campusTab === 'notice' && !campusSearch.trim() && portalItemCount" class="campus-load-more"><button v-if="canLoadMorePortalItems" class="secondary-button" type="button" @click="portalVisibleCount = Math.min(50, portalVisibleCount + 10)">再显示十条</button><a v-else class="secondary-button" href="http://my.bupt.edu.cn/" target="_blank" rel="noopener noreferrer">请前往官网查看更多通知</a></div>
         </section>
 
         <section v-else-if="currentPage === 'electricity'" class="page electricity-page">
-          <header class="page-heading"><span class="eyebrow">校园生活</span><h1>查电费</h1><p>绑定宿舍后，每次打开邮学伴会自动查询一次；余额不足 10 元或剩余总电量不足 10 度时会加入消息提醒。</p></header>
+          <header class="page-heading"><span class="eyebrow">校园生活</span><h1>查电费</h1><p>绑定宿舍后，每次打开邮学伴会自动查询一次；余额不足 10 元或剩余总电量不足 10 度时会加入消息提醒</p></header>
           <article v-if="electricityEditing" class="surface electricity-bind-card">
-            <div><span class="electricity-icon"><IconGlyph name="electricity" :size="26" /></span><h2>{{ electricityDormitory ? '修改宿舍号' : '初次查询先绑定宿舍号' }}</h2><p>只需填写楼宇和宿舍号，中间可使用横杠、空格或不加分隔符。S2–S6 自动识别为沙河雁南园，A、B、C、D1、D2、E 自动识别为沙河雁北园，“学n”楼自动识别为西土城，n 可写数字或汉字一至十；宿舍号第一位即楼层。</p></div>
+            <div><span class="electricity-icon"><IconGlyph name="electricity" :size="26" /></span><h2>{{ electricityDormitory ? '修改宿舍号' : '初次查询先绑定宿舍号' }}</h2><p>只需填写楼宇和宿舍号，中间可使用横杠、空格或不加分隔符S2–S6 自动识别为沙河雁南园，A、B、C、D1、D2、E 自动识别为沙河雁北园，“学n”楼自动识别为西土城，n 可写数字或汉字一至十；宿舍号第一位即楼层</p></div>
             <form @submit.prevent="saveElectricityBinding"><label>楼宇宿舍号<input v-model="electricityDormitoryDraft" maxlength="16" autocomplete="off" placeholder="例如 A410、S2-410、学8 321、学八321" /></label><p v-if="electricityError" class="form-error" role="alert">{{ electricityError }}</p><footer><button v-if="electricityDormitory" class="secondary-button" type="button" @click="electricityEditing = false; electricityError = ''">取消</button><button class="primary-button" type="submit" :disabled="electricityBusy">{{ electricityBusy ? '正在查询…' : '绑定并查询' }}</button></footer></form>
           </article>
           <article v-else class="surface electricity-result-card" :class="{ low: electricityResult && electricityResult.balance < 10 }">
-            <div class="surface-heading"><div><span class="eyebrow">已绑定宿舍</span><h2>{{ electricityDormitory }}</h2></div><button class="text-button" type="button" @click="editElectricityBinding">修改</button></div>
+            <div class="surface-heading"><div><span class="eyebrow">已绑定宿舍</span><h2>{{ electricityDormitory }}</h2></div><button class="danger-button" type="button" @click="unbindElectricity">解除绑定</button></div>
             <div v-if="electricityResult" class="balance-display"><small>{{ electricityResult.unit === '元' ? '当前余额' : '剩余总电量（含赠送电量）' }}</small><strong>{{ electricityResult.balance.toFixed(2) }}<b> {{ electricityResult.unit }}</b></strong><span v-if="electricityResult.balance < 10">{{ electricityResult.unit === '元' ? '余额' : '剩余总电量' }}不足 10 {{ electricityResult.unit }}，请及时充值</span><span v-else>{{ electricityResult.unit === '元' ? '余额' : '剩余总电量' }}充足</span><div class="balance-times"><time>电费更新于 {{ formatDateTime(electricityResult.updatedAt) }}</time><time>本次查询于 {{ formatDateTime(electricityResult.queriedAt) }}</time></div></div>
             <div v-else-if="electricityBusy" class="electricity-loading"><IconGlyph name="refresh" :size="26" /><strong>正在查询电费余额</strong></div>
             <p v-if="electricityError" class="service-warning" role="alert">{{ electricityError }}</p>
@@ -2278,7 +2536,7 @@ async function changePassword(): Promise<void> {
         </section>
 
         <section v-else-if="currentPage === 'assistant'" class="page assistant-page">
-          <header class="page-heading"><span class="eyebrow">{{ assistantMode === 'online' ? '在线 AI' : assistantMode === 'error' ? '连接失败' : '学习问答' }}</span><h1>学习助手</h1><p>提问课程知识、上传题目图片，或让助手结合课表和任务规划学习。</p><div v-if="assistantRuntime" class="assistant-runtime" aria-label="当前助手配置"><span><small>模型</small><strong>{{ assistantModelLabel }}</strong></span><span v-if="assistantRuntime.thinkingSupported"><small>思考</small><strong>{{ assistantThinkingEnabled ? '已开启' : '已关闭' }}</strong></span><span v-if="assistantRuntime.webSearchEnabled !== undefined"><small>联网搜索</small><strong>{{ assistantRuntime.webSearchEnabled ? '已开启' : '已关闭' }}</strong></span><span v-if="assistantRuntime.contextWindow" class="token-usage" :class="{ warning: assistantContextNearLimit, full: assistantContextBlocked }"><small>上下文</small><strong>{{ assistantTokenLabel }}</strong><span class="token-meter" role="progressbar" aria-label="上下文 token 使用量" :aria-valuenow="assistantContextTokens" aria-valuemin="0" :aria-valuemax="assistantRuntime.contextWindow"><i :style="{ width: `${assistantContextPercent}%` }" /></span></span></div></header>
+          <header class="page-heading"><span class="eyebrow">{{ assistantMode === 'online' ? 'DeepSeek 在线' : assistantMode === 'error' ? '连接失败' : '学习问答' }}</span><div class="heading-with-action"><h1>学习助手</h1><button class="secondary-button" type="button" @click="openAiConfig"><IconGlyph name="settings" />模型设置</button></div><p>当前仅支持 DeepSeek 官方 API；可以提问课程知识、上传题目图片，或让助手结合课表和任务规划学习</p><div v-if="assistantRuntime" class="assistant-runtime" aria-label="当前助手配置"><span><small>模型</small><select :value="assistantRuntime.model" aria-label="当前模型" @change="changeAssistantModel"><option v-for="model in (aiModels.length ? aiModels : [assistantRuntime.model])" :key="model" :value="model">{{ model }}</option></select></span><span v-if="assistantRuntime.thinkingSupported"><small>思考</small><strong>{{ assistantThinkingEnabled ? '已开启' : '已关闭' }}</strong></span><span v-if="assistantRuntime.webSearchEnabled !== undefined"><small>联网搜索</small><strong>{{ assistantRuntime.webSearchEnabled ? '已开启' : '已关闭' }}</strong></span><span v-if="assistantRuntime.contextWindow" class="token-usage" :class="{ warning: assistantContextNearLimit, full: assistantContextBlocked }"><small>上下文</small><strong>{{ assistantTokenLabel }}</strong><span class="token-meter" role="progressbar" aria-label="上下文 token 使用量" :aria-valuenow="assistantContextTokens" aria-valuemin="0" :aria-valuemax="assistantRuntime.contextWindow"><i :style="{ width: `${assistantContextPercent}%` }" /></span></span></div><div v-else class="inline-setup"><span>尚未配置 DeepSeek API Key，配置完成后助手才会发送请求</span><button class="primary-button" type="button" @click="openAiConfig">立即配置</button></div></header>
           <div class="assistant-workspace">
             <div class="assistant-chat-column">
               <div class="quick-prompts"><button v-for="prompt in ['解释这道题的思路','我今天有什么课？','列出三天内的 DDL','帮我制定复习计划']" :key="prompt" type="button" :disabled="assistantBusy || assistantContextBlocked" @click="sendAssistant(prompt)">{{ prompt }}</button></div>
@@ -2295,28 +2553,28 @@ async function changePassword(): Promise<void> {
               </div>
               <div v-if="assistantAttachments.length" class="assistant-attachment-tray"><span v-for="attachment in assistantAttachments" :key="attachment.id"><img :src="attachment.dataUrl" :alt="attachment.name" /><small>{{ attachment.name }}</small><button type="button" aria-label="移除附件" @click="removeAssistantAttachment(attachment.id)"><IconGlyph name="close" :size="13" /></button></span></div>
               <form class="assistant-composer" :class="{ blocked: assistantContextBlocked }" @submit.prevent="sendAssistant()"><input ref="assistantFileInput" type="file" hidden multiple :accept="assistantRuntime?.allowedFileTypes?.join(',')" @change="selectAssistantFiles" /><button class="composer-tool" type="button" :disabled="assistantContextBlocked || !assistantRuntime?.allowedFileTypes?.length" aria-label="上传图片" title="上传当前模型支持的图片" @click="openAssistantFilePicker"><IconGlyph name="plus" /></button><textarea ref="assistantTextarea" v-model="assistantInput" rows="1" :placeholder="assistantContextBlocked ? '上下文已满，请新建对话后继续' : '给学习助手发送信息'" aria-describedby="assistant-context-note" @input="resizeAssistantComposer" @keydown.enter.exact.prevent="sendAssistant()" /><button v-if="assistantRuntime?.thinkingSupported" class="thinking-toggle" :class="{ active: assistantThinkingEnabled }" type="button" :aria-pressed="assistantThinkingEnabled" @click="assistantThinkingEnabled = !assistantThinkingEnabled"><IconGlyph name="assistant" :size="16" /><span>{{ assistantThinkingEnabled ? '思考' : '快速' }}</span></button><button class="composer-send" type="submit" :disabled="assistantBusy || assistantContextBlocked || (!assistantInput.trim() && !assistantAttachments.length)" :aria-label="assistantContextBlocked ? '上下文已满，无法发送' : '发送'"><IconGlyph name="send" /></button></form>
-              <p id="assistant-context-note" class="assistant-note" :class="{ warning: assistantContextNearLimit, full: assistantContextBlocked }" :role="assistantContextBlocked ? 'alert' : undefined">{{ assistantContextBlocked ? '上下文已满，已停止发送。请新建对话后继续。' : assistantContextNearLimit ? `上下文已使用 ${assistantContextPercent}%，接近上限。` : assistantMode === 'error' ? `在线 AI 暂不可用：${assistantError}` : '支持 PNG、JPG、WebP 图片；回答仅供学习参考，请自行核对关键结论。' }}</p>
+              <p id="assistant-context-note" class="assistant-note" :class="{ warning: assistantContextNearLimit, full: assistantContextBlocked }" :role="assistantContextBlocked ? 'alert' : undefined">{{ assistantContextBlocked ? '上下文已满，已停止发送请新建对话后继续' : assistantContextNearLimit ? `上下文已使用 ${assistantContextPercent}%，接近上限` : assistantMode === 'error' ? `在线 AI 暂不可用：${assistantError}` : '支持 PNG、JPG、WebP 图片；回答仅供学习参考，请自行核对关键结论' }}</p>
             </div>
             <aside class="conversation-sidebar surface"><header><strong>对话</strong><button class="icon-button" type="button" :disabled="activeConversationIsBlank" :aria-label="activeConversationIsBlank ? '当前已是空白对话' : '新建对话'" @click="newAssistantConversation"><IconGlyph name="plus" /></button></header><div ref="conversationListRef" class="conversation-list"><span class="conversation-glider" :class="{ ready: conversationGliderReady }" :style="conversationGliderStyle" aria-hidden="true" /><div v-for="conversation in listedAssistantConversations" :key="conversation.id" class="conversation-item" :class="{ active: conversation.id === activeConversationId }" :data-conversation-id="conversation.id"><button class="conversation-select" type="button" @click="selectAssistantConversation(conversation.id)"><strong>{{ conversation.title }}</strong><small>{{ formatDateTime(conversation.updatedAt) }}</small></button><button class="conversation-delete" :class="{ confirming: assistantDeleteConfirmId === conversation.id }" type="button" :aria-label="assistantDeleteConfirmId === conversation.id ? '确认删除对话' : '删除对话'" @click="deleteAssistantConversation(conversation.id)"><span v-if="assistantDeleteConfirmId === conversation.id">确认删除</span><IconGlyph v-else name="trash" :size="14" /></button></div></div></aside>
           </div>
         </section>
 
         <section v-else-if="currentPage === 'notifications'" class="page narrow-page">
-          <header class="page-heading split"><div><span class="eyebrow">消息中心</span><h1>通知</h1><p>课程、DDL 和校园订阅都集中在这里。</p></div><button class="secondary-button" type="button" @click="markAllNotificationsRead">全部已读</button></header>
+          <header class="page-heading split"><div><span class="eyebrow">消息中心</span><h1>通知</h1><p>课程、DDL 和校园动态都集中在这里</p></div><button class="secondary-button" type="button" @click="markAllNotificationsRead">全部已读</button></header>
           <div class="notification-list surface"><button v-for="item in notifications" :key="item.id" type="button" :class="{ unread: !item.read }" @click="item.read = true"><span class="notification-icon" :class="`type-${item.type}`"><IconGlyph :name="item.type === 'course' ? 'courses' : item.type === 'task' ? 'tasks' : 'campus'" /></span><span><strong>{{ item.title }}</strong><small>{{ item.body }}</small><time>{{ formatDateTime(item.createdAt) }}</time></span><span v-if="!item.read" class="unread-dot" /></button></div>
         </section>
 
         <section v-else class="page narrow-page settings-page">
-          <header class="page-heading"><span class="eyebrow">个人偏好</span><h1>设置</h1><p>管理提醒、显示和隐私，不需要修改配置文件。</p></header>
-          <article class="settings-section surface profile-settings"><div><h2>个人资料</h2><p>昵称会用于问候；头像可从本地上传，图片只保存在当前设备。</p></div><div class="profile-editor"><span class="avatar avatar-preview"><img v-if="profileDraftAvatar" :src="profileDraftAvatar" alt="头像预览" /><template v-else>{{ profileDraftName.trim().slice(0, 1) || '邮' }}</template></span><div class="profile-fields"><label>昵称<input v-model="profileDraftName" maxlength="20" placeholder="该怎么称呼你" @input="profileEditError = ''" /></label><div class="avatar-upload-actions"><label class="secondary-button file-button"><IconGlyph name="upload" :size="16" />上传头像<input type="file" accept="image/png,image/jpeg,image/webp" @change="selectAvatarFile" /></label><button v-if="profileDraftAvatar" class="text-button" type="button" @click="clearAvatarDraft">移除头像</button><small>PNG、JPG 或 WebP，不超过 2 MB</small></div><p v-if="profileEditError" class="inline-error" role="alert">{{ profileEditError }}</p></div><button class="secondary-button" type="button" @click="saveProfile">保存资料</button></div></article>
-          <article class="settings-section surface appearance-settings"><div><h2>外观与动效</h2><p>选择显示模式，并按需要降低界面动态效果。</p></div><div class="appearance-controls"><div class="segmented"><button v-for="option in [{id:'system',label:'跟随系统'},{id:'light',label:'浅色'},{id:'dark',label:'深色'}]" :key="option.id" type="button" :class="{ active: preferences.theme === option.id }" @click="preferences.theme = option.id as Preferences['theme']">{{ option.label }}</button></div><label class="switch-row motion-setting"><span><strong>减少动画效果</strong><small>关闭菜单滑动和页面淡入淡出，适合对动态效果敏感时使用</small></span><input v-model="preferences.reduceMotion" type="checkbox" role="switch" aria-label="减少动画效果" /></label></div></article>
-          <article class="settings-section surface"><div><h2>默认提醒</h2><p>任务可选择分钟、小时或天；切换单位时自动换算。仅允许整数，非法输入会恢复上次有效设置。</p></div><label>任务提前<div class="reminder-control"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="defaultTaskReminderValue" @input="updateDefaultTaskReminderInput" @blur="restoreDefaultTaskReminderInput" /><select :value="defaultTaskReminderUnit" aria-label="任务提醒单位" @change="changeDefaultTaskReminderUnit"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="courseReminderValue" @input="updateCourseReminderInput" @blur="restoreCourseReminderInput" /><span>分钟</span></div></label></article>
-          <article class="settings-section surface notification-settings"><div><h2>桌面通知</h2><p>控制课程和任务到期时的系统提醒，不属于隐私授权。</p></div><label class="switch-row"><span><strong>允许系统通知</strong><small>提醒时播放声音，并在应用运行时显示 Windows 系统通知</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="桌面通知" @change="handleBrowserNotificationsChange" /></label></article>
-          <article class="settings-section surface"><div><h2>学期课表</h2><p>第 1 周起始日，用于计算周次；周课表仍按周一至周日排列。</p></div><label>第一周开始<input v-model="preferences.semesterStart" type="date" /></label></article>
-          <article class="settings-section surface"><div><h2>静默时段</h2><p>默认不弹出提醒；只有任务中勾选“静默时段仍提醒”的事项例外。</p></div><label>开始<input v-model="preferences.quietStart" type="time" /></label><label>结束<input v-model="preferences.quietEnd" type="time" /></label></article>
-          <article class="settings-section surface account-settings"><div><h2>账号</h2><p>修改密码后，所有设备上的登录会话都会失效，需要使用新密码重新登录。</p></div><div class="account-actions"><button class="secondary-button" type="button" :disabled="passwordChangeBusy" @click="passwordChangeError = ''; passwordChangeOpen = true">修改密码</button><button class="secondary-button" type="button" :disabled="accountLogoutBusy" @click="accountLogoutConfirmOpen = true">退出账号</button></div></article>
-          <article class="settings-section surface privacy-settings"><div><h2>隐私</h2><p>控制助手如何使用你的数据。</p></div><div class="switch-row"><span><strong>个性化记忆</strong><small>允许助手参考当前对话的历史消息与称呼</small></span><input v-model="preferences.memoryEnabled" type="checkbox" role="switch" aria-label="个性化记忆" /></div><div class="switch-row"><span><strong>学习数据分析</strong><small>允许助手分析本地课程、任务与学习节奏</small></span><input v-model="preferences.analyticsEnabled" type="checkbox" role="switch" aria-label="学习数据分析" /></div></article>
-          <section class="danger-section" aria-labelledby="danger-section-title"><header><span class="eyebrow">请谨慎操作</span><h2 id="danger-section-title">危险区</h2><p>以下操作会清除本机数据，执行前均需要再次确认。</p></header><div class="danger-actions"><article class="danger-zone surface"><div><h3>清空课程表</h3><p>删除当前课表中的全部课程，不影响任务和其他个人设置。</p></div><button class="danger-button" :class="{ confirming: courseClearConfirming }" type="button" @click="clearCourses">{{ courseClearConfirming ? '再次点击确认清空' : '清空课表' }}</button></article><article class="danger-zone surface"><div><h3>重置个人信息</h3><p>清除当前设备中的昵称、头像、任务、课表、设置、已读与订阅状态。</p></div><button class="danger-button" :class="{ confirming: resetConfirming }" type="button" @click="resetAllPersonalData">{{ resetConfirming ? '确认永久重置' : '重置所有个人信息' }}</button></article></div></section>
+          <header class="page-heading"><span class="eyebrow">个人偏好</span><h1>设置</h1><p>{{ TEXTS.pages.settingsDescription }}</p></header>
+          <article class="settings-section surface profile-settings"><div><h2>个人资料</h2><p>昵称会用于问候；头像可从本地上传，图片只保存在当前设备</p></div><div class="profile-editor"><span class="avatar avatar-preview"><img v-if="profileDraftAvatar" :src="profileDraftAvatar" alt="头像预览" /><template v-else>{{ profileDraftName.trim().slice(0, 1) || '邮' }}</template></span><div class="profile-fields"><label>昵称<input v-model="profileDraftName" maxlength="20" placeholder="该怎么称呼你" @input="profileEditError = ''" /></label><div class="avatar-upload-actions"><label class="secondary-button file-button"><IconGlyph name="upload" :size="16" />上传头像<input type="file" accept="image/png,image/jpeg,image/webp" @change="selectAvatarFile" /></label><button v-if="profileDraftAvatar" class="text-button" type="button" @click="clearAvatarDraft">移除头像</button><small>PNG、JPG 或 WebP，不超过 2 MB</small></div><p v-if="profileEditError" class="inline-error" role="alert">{{ profileEditError }}</p></div><button class="secondary-button" type="button" @click="saveProfile">保存资料</button></div></article>
+          <article class="settings-section surface appearance-settings"><div><h2>外观与动效</h2><p>选择显示模式，并按需要降低界面动态效果</p></div><div class="appearance-controls"><div class="segmented"><button v-for="option in [{id:'system',label:'跟随系统'},{id:'light',label:'浅色'},{id:'dark',label:'深色'}]" :key="option.id" type="button" :class="{ active: preferences.theme === option.id }" @click="preferences.theme = option.id as Preferences['theme']">{{ option.label }}</button></div><label class="switch-row motion-setting"><span><strong>减少动画效果</strong><small>关闭菜单滑动和页面淡入淡出，适合对动态效果敏感时使用</small></span><input v-model="preferences.reduceMotion" type="checkbox" role="switch" aria-label="减少动画效果" /></label></div></article>
+          <article class="settings-section surface"><div><h2>默认提醒</h2><p>{{ TEXTS.pages.reminderDescription }}</p></div><label>任务提前<div class="reminder-control"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="defaultTaskReminderValue" @input="updateDefaultTaskReminderInput" @blur="restoreDefaultTaskReminderInput" /><select :value="defaultTaskReminderUnit" aria-label="任务提醒单位" @change="changeDefaultTaskReminderUnit"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="courseReminderValue" @input="updateCourseReminderInput" @blur="restoreCourseReminderInput" /><span>分钟</span></div></label></article>
+          <article class="settings-section surface notification-settings"><div><h2>通知设置</h2><p>声音和 Windows通知可以分别控制</p></div><div class="notification-controls"><label class="switch-row"><span><strong>播放声音</strong><small>提醒触发时播放提示音</small></span><input v-model="preferences.soundNotifications" type="checkbox" role="switch" aria-label="播放声音" /></label><label class="switch-row"><span><strong>Windows通知</strong><small>在应用运行时显示系统通知</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="Windows通知" @change="handleBrowserNotificationsChange" /></label></div></article>
+          <article class="settings-section surface"><div><h2>学期课表</h2><p>第 1 周起始日，用于计算周次；周课表仍按周一至周日排列</p></div><label>第一周开始<input v-model="preferences.semesterStart" type="date" /></label></article>
+          <article class="settings-section surface"><div><h2>静默时段</h2><p>{{ TEXTS.pages.quietHoursDescription }}</p></div><label>开始<input v-model="preferences.quietStart" type="time" /></label><label>结束<input v-model="preferences.quietEnd" type="time" /></label></article>
+          <article class="settings-section surface privacy-settings"><div><h2>隐私</h2><p>控制助手如何使用你的数据</p></div><div class="switch-row"><span><strong>个性化记忆</strong><small>允许助手参考当前对话的历史消息与称呼</small></span><input v-model="preferences.memoryEnabled" type="checkbox" role="switch" aria-label="个性化记忆" /></div><div class="switch-row"><span><strong>学习数据分析</strong><small>允许助手分析本地课程、任务与学习节奏</small></span><input v-model="preferences.analyticsEnabled" type="checkbox" role="switch" aria-label="学习数据分析" /></div></article>
+          <section class="danger-section" aria-labelledby="danger-section-title"><header><span class="eyebrow">请谨慎操作</span><h2 id="danger-section-title">危险区</h2><p>以下操作会清除本机数据，执行前均需要再次确认</p></header><div class="danger-actions"><article class="danger-zone surface"><div><h3>本机凭据</h3><p>统一身份认证和教务系统账号密码仅保存在本机</p></div><div class="account-actions"><button class="secondary-button" type="button" @click="openAccountBinding">{{ localSettings.campus.configured ? '修改本机凭据' : '绑定账号' }}</button><button v-if="localSettings.campus.configured" class="danger-button" :class="{ confirming: campusDeleteConfirming }" type="button" @click="deleteAccountBinding">{{ campusDeleteConfirming ? '再次点击确认删除' : '删除本机凭据' }}</button></div></article><article class="danger-zone surface"><div><h3>模型配置</h3><p>DeepSeek API Key 和模型选择保存在本机</p></div><div class="account-actions"><button class="secondary-button" type="button" @click="openAiConfig">{{ localSettings.ai.configured ? '修改模型设置' : '配置模型' }}</button><button v-if="localSettings.ai.configured" class="danger-button" :class="{ confirming: aiDeleteConfirming }" type="button" @click="deleteAiConfig">{{ aiDeleteConfirming ? '再次点击确认删除' : '删除模型配置' }}</button></div></article><article class="danger-zone surface"><div><h3>清空课程表</h3><p>删除当前课表中的全部课程，不影响任务和其他个人设置</p></div><button class="danger-button" :class="{ confirming: courseClearConfirming }" type="button" @click="clearCourses">{{ courseClearConfirming ? '再次点击确认清空' : '清空课表' }}</button></article><article class="danger-zone surface"><div><h3>重置个人信息</h3><p>清除昵称、头像、任务、课表、设置、凭据和模型配置</p></div><button class="danger-button" :class="{ confirming: resetConfirming }" type="button" @click="resetAllPersonalData">{{ resetConfirming ? '确认永久重置' : '重置所有个人信息' }}</button></article></div></section>
+          <p class="app-credit">{{ TEXTS.pages.credit }}</p>
         </section>
         </Transition>
       </main>
@@ -2334,7 +2592,7 @@ async function changePassword(): Promise<void> {
     </Transition>
 
     <div v-if="taskModalOpen" class="modal-backdrop" @click.self="taskModalOpen = false">
-      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header><div><span class="eyebrow">新建</span><h2 id="task-modal-title">添加任务</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="taskModalOpen = false"><IconGlyph name="close" /></button></header><form @submit.prevent="createTask"><label>任务内容<input v-model="taskForm.title" autofocus placeholder="例如：完成软件工程需求分析" /></label><div class="form-grid"><label>课程或分类<input v-model="taskForm.course" placeholder="个人计划" /></label><label>截止时间<input v-model="taskForm.dueAt" type="datetime-local" /></label></div><label>提前提醒（分钟）<input v-model.number="taskForm.reminderMinutes" type="number" min="0" max="10080" step="1" placeholder="0 表示到点提醒" /></label><label class="switch-row modal-switch"><span><strong>静默时段仍提醒</strong><small>仅为确实不能错过的任务开启</small></span><input v-model="taskForm.remindDuringQuiet" type="checkbox" role="switch" /></label><footer><button class="secondary-button" type="button" @click="taskModalOpen = false">取消</button><button class="primary-button" type="submit">添加任务</button></footer></form></section>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header><div><span class="eyebrow">{{ editingTaskId === null ? '新建' : '编辑' }}</span><h2 id="task-modal-title">{{ editingTaskId === null ? '添加任务' : '编辑任务' }}</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="taskModalOpen = false"><IconGlyph name="close" /></button></header><form @submit.prevent="createTask"><label>任务内容<input v-model="taskForm.title" autofocus placeholder="例如：完成软件工程需求分析" /></label><div class="form-grid"><label>课程或分类<input v-model="taskForm.course" placeholder="个人计划" /></label><label>截止时间<input v-model="taskForm.dueAt" type="datetime-local" /></label></div><label>提前提醒（分钟）<input v-model.number="taskForm.reminderMinutes" type="number" min="0" max="10080" step="1" placeholder="0 表示到点提醒" /></label><label class="switch-row modal-switch"><span><strong>静默时段仍提醒</strong><small>仅为确实不能错过的任务开启</small></span><input v-model="taskForm.remindDuringQuiet" type="checkbox" role="switch" /></label><footer><button class="secondary-button" type="button" @click="taskModalOpen = false">取消</button><button class="primary-button" type="submit">{{ editingTaskId === null ? '添加任务' : '保存修改' }}</button></footer></form></section>
     </div>
 
     <div v-if="courseAddOpen" class="modal-backdrop" @click.self="courseAddOpen = false">
@@ -2346,13 +2604,13 @@ async function changePassword(): Promise<void> {
         <header><div><span class="eyebrow">步骤 {{ importStep }} / 3</span><h2 id="import-modal-title">导入课表</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="courseImportOpen = false"><IconGlyph name="close" /></button></header>
         <div class="step-indicator"><span v-for="step in 3" :key="step" :class="{ active: step <= importStep }" /></div>
         <div v-if="importStep === 1" class="import-body">
-          <div class="import-options"><button type="button" :class="{ active: importMode === 'class' }" @click="importMode = 'class'; importError = ''"><IconGlyph name="book" :size="24" /><strong>按班级导入</strong><span>使用已配置的教务系统会话读取</span></button><button type="button" :class="{ active: importMode === 'file' }" @click="importMode = 'file'; importError = ''"><IconGlyph name="upload" :size="24" /><strong>上传课表文件</strong><span>在本机解析 XLS/XLSX/CSV</span></button></div>
-          <label v-if="importMode === 'class'">班级号<input v-model="importClassId" placeholder="请输入完整班级号" /></label>
-          <label v-else class="file-drop"><IconGlyph name="upload" :size="26" /><strong>{{ importFile?.name || '选择课表文件' }}</strong><span>{{ importPreview.length ? `已识别 ${importPreview.length} 门课程` : '文件只在本机解析，不会上传到第三方' }}</span><input type="file" accept=".xls,.xlsx,.csv" @change="selectImportFile" /></label>
+          <div class="import-options"><button type="button" :class="{ active: importMode === 'mine' }" @click="importMode = 'mine'; importError = ''"><IconGlyph name="courses" :size="24" /><strong>一键导入我的课表</strong><span>登录教务系统并读取当前学生课表</span></button><button type="button" :class="{ active: importMode === 'file' }" @click="importMode = 'file'; importError = ''"><IconGlyph name="upload" :size="24" /><strong>上传课表文件</strong><span>在本机解析 XLS/XLSX/CSV</span></button></div>
+          <p v-if="importMode === 'mine'" class="modal-note">{{ localSettings.campus.configured ? '将使用本机保存的教务系统账号读取你的个人课表' : '请先在设置中绑定教务系统账号' }}</p>
+          <label v-if="importMode === 'file'" class="file-drop"><IconGlyph name="upload" :size="26" /><strong>{{ importFile?.name || '选择课表文件' }}</strong><span>{{ importPreview.length ? `已识别 ${importPreview.length} 门课程` : '文件只在本机解析，不会上传到第三方' }}</span><input type="file" accept=".xls,.xlsx,.csv" @change="selectImportFile" /></label>
           <p v-if="importError" class="form-error" role="alert">{{ importError }}</p>
         </div>
         <div v-else-if="importStep === 2" class="import-preview"><div class="preview-stat"><strong>{{ importPreview.length }}</strong><span>识别课程</span></div><div class="preview-stat"><strong>{{ selectedImportCourses.length }}</strong><span>已勾选</span></div><div class="preview-stat warning"><strong>{{ selectedImportCourses.filter(item => courses.some(course => course.name === item.name && course.weekday === item.weekday && course.startSection === item.startSection)).length }}</strong><span>将更新</span></div><div class="import-course-list"><label v-for="(item, index) in importPreview" :key="`${item.name}-${item.weekday}-${item.startSection}-${index}`" class="import-course-item"><span><b>{{ item.name }}</b>{{ weekdays[item.weekday - 1] ?? `周${item.weekday}` }} 第 {{ item.startSection }}–{{ item.endSection }} 节</span><input v-model="importSelections[index]" type="checkbox" :aria-label="`选择导入${item.name}`" /></label></div></div>
-        <div v-else class="import-finish"><span class="success-icon"><IconGlyph name="check" :size="28" /></span><h3>预览完成</h3><template v-if="courses.length"><p>当前已有 {{ courses.length }} 门课程。请选择新课表的处理方式：</p><div class="import-strategy" role="radiogroup" aria-label="新课表处理方式"><label :class="{ active: importStrategy === 'replace' }"><input v-model="importStrategy" type="radio" value="replace" /><span><strong>替换原课表</strong><small>清空现有课程后写入新课表</small></span></label><label :class="{ active: importStrategy === 'merge' }"><input v-model="importStrategy" type="radio" value="merge" /><span><strong>合并课表</strong><small>保留原课程并更新重复课程</small></span></label></div></template><p v-if="selectedImportCourses.length">确认后会把已勾选的 {{ selectedImportCourses.length }} 门课程写入你的课表。</p><p v-else>请至少勾选一门课程后再确认导入。</p></div>
+        <div v-else class="import-finish"><span class="success-icon"><IconGlyph name="check" :size="28" /></span><h3>预览完成</h3><template v-if="courses.length"><p>当前已有 {{ courses.length }} 门课程请选择新课表的处理方式：</p><div class="import-strategy" role="radiogroup" aria-label="新课表处理方式"><label :class="{ active: importStrategy === 'replace' }"><input v-model="importStrategy" type="radio" value="replace" /><span><strong>替换原课表</strong><small>清空现有课程后写入新课表</small></span></label><label :class="{ active: importStrategy === 'merge' }"><input v-model="importStrategy" type="radio" value="merge" /><span><strong>合并课表</strong><small>保留原课程并更新重复课程</small></span></label></div></template><p v-if="selectedImportCourses.length">确认后会把已勾选的 {{ selectedImportCourses.length }} 门课程写入你的课表</p><p v-else>请至少勾选一门课程后再确认导入</p></div>
         <footer><button class="secondary-button" type="button" :disabled="importBusy" @click="importStep === 1 ? courseImportOpen = false : importStep--">{{ importStep === 1 ? '取消' : '上一步' }}</button><button class="primary-button" type="button" :disabled="importBusy || (importStep === 3 && !selectedImportCourses.length)" @click="advanceImport">{{ importBusy ? '正在读取…' : importStep === 3 ? `确认导入 ${selectedImportCourses.length} 门` : '下一步' }}</button></footer>
       </section>
     </div>
@@ -2365,32 +2623,38 @@ async function changePassword(): Promise<void> {
       </aside>
     </div>
 
-    <div v-if="selectedCampusItem" class="modal-backdrop" @click.self="selectedCampusItem = null"><section class="modal campus-detail" role="dialog" aria-modal="true" aria-label="校园信息详情"><header><span class="category-chip">{{ selectedCampusItem.category }}</span><button class="icon-button" type="button" aria-label="关闭" @click="selectedCampusItem = null"><IconGlyph name="close" /></button></header><h2>{{ selectedCampusItem.title }}</h2><div v-if="campusSummaryBusy" class="summary-loading"><IconGlyph name="assistant" /><span>AI 正在阅读官方通知并生成总结…</span></div><p v-else-if="selectedCampusItem.summary">{{ selectedCampusItem.summary }}</p><p v-else-if="campusSummaryError" class="form-error" role="alert">{{ campusSummaryError }}</p><p v-else>该条目暂时没有可显示的简介。</p><dl><div><dt>来源</dt><dd>{{ selectedCampusItem.source }}</dd></div><div><dt>发布时间</dt><dd>{{ formatDateTime(selectedCampusItem.publishedAt) }}</dd></div><div v-if="selectedCampusItem.eventTime"><dt>活动时间</dt><dd>{{ formatDateTime(selectedCampusItem.eventTime) }}</dd></div></dl><footer><button class="secondary-button" type="button" @click="toggleCampusSubscription(selectedCampusItem)">{{ selectedCampusItem.subscribed ? '取消订阅' : '订阅更新' }}</button><a class="primary-button" :href="selectedCampusItem.url" target="_blank" rel="noopener noreferrer"><IconGlyph name="external" />查看原文</a></footer></section></div>
+        <div v-if="selectedCampusItem" class="modal-backdrop" @click.self="selectedCampusItem = null"><section class="modal campus-detail" role="dialog" aria-modal="true" aria-label="校园信息详情"><header><span class="category-chip">{{ selectedCampusItem.category }}</span><button class="icon-button" type="button" aria-label="关闭" @click="selectedCampusItem = null"><IconGlyph name="close" /></button></header><h2>{{ selectedCampusItem.title }}</h2><div v-if="campusSummaryBusy" class="summary-loading"><IconGlyph name="assistant" /><span>{{ TEXTS.campus.summaryLoading }}</span></div><p v-else-if="selectedCampusItem.summary">{{ selectedCampusItem.summary }}</p><p v-else-if="campusSummaryError" class="form-error" role="alert">{{ campusSummaryError }}</p><p v-else>{{ TEXTS.campus.summaryUnavailable }}</p><dl><div><dt>来源</dt><dd>{{ selectedCampusItem.source }}</dd></div><div><dt>发布时间</dt><dd>{{ formatDateTime(selectedCampusItem.publishedAt) }}</dd></div><div v-if="selectedCampusItem.eventTime"><dt>活动时间</dt><dd>{{ formatDateTime(selectedCampusItem.eventTime) }}</dd></div></dl><footer><a class="primary-button" :href="selectedCampusItem.url" target="_blank" rel="noopener noreferrer"><IconGlyph name="external" />查看原文</a></footer></section></div>
 
-    <div v-if="accountLogoutConfirmOpen" class="modal-backdrop" @click.self="accountLogoutConfirmOpen = false">
-      <section class="modal logout-modal" role="dialog" aria-modal="true" aria-labelledby="logout-modal-title">
-        <header><div><span class="eyebrow">退出当前账号</span><h2 id="logout-modal-title">确认退出登录？</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="accountLogoutConfirmOpen = false"><IconGlyph name="close" /></button></header>
-        <p>退出后，本机保存的个人资料、任务、课程、设置和对话仍会保留，下次登录会继续显示。</p>
-        <p>为保护账号，本机保存的登录密码和自动登录设置会被清除；下次登录需要重新输入账号和密码。</p>
-        <footer><button class="secondary-button" type="button" :disabled="accountLogoutBusy" @click="accountLogoutConfirmOpen = false">取消</button><button class="primary-button" type="button" :disabled="accountLogoutBusy" @click="logoutAccount">{{ accountLogoutBusy ? '正在退出…' : '确认退出' }}</button></footer>
-      </section>
-    </div>
-
-    <div v-if="passwordChangeOpen" class="modal-backdrop" @click.self="!passwordChangeBusy && (passwordChangeOpen = false)">
-      <section class="modal password-modal" role="dialog" aria-modal="true" aria-labelledby="password-modal-title">
-        <header><div><span class="eyebrow">账号安全</span><h2 id="password-modal-title">修改密码</h2></div><button class="icon-button" type="button" aria-label="关闭" :disabled="passwordChangeBusy" @click="passwordChangeOpen = false"><IconGlyph name="close" /></button></header>
-        <form @submit.prevent="changePassword">
-          <label>原密码<input v-model="passwordChangeForm.currentPassword" type="password" autocomplete="current-password" placeholder="请输入原密码" /></label>
-          <label>新密码<input v-model="passwordChangeForm.newPassword" type="password" autocomplete="new-password" placeholder="6 到 128 个字符" /></label>
-          <label>确认新密码<input v-model="passwordChangeForm.confirmPassword" type="password" autocomplete="new-password" placeholder="再次输入新密码" /></label>
-          <p v-if="passwordChangeError" class="form-error" role="alert">{{ passwordChangeError }}</p>
-          <p class="modal-note">修改成功后会退出当前登录，需要使用新密码重新登录。</p>
-          <footer><button class="secondary-button" type="button" :disabled="passwordChangeBusy" @click="passwordChangeOpen = false">取消</button><button class="primary-button" type="submit" :disabled="passwordChangeBusy">{{ passwordChangeBusy ? '正在修改…' : '确认修改' }}</button></footer>
+    <div v-if="accountBindingOpen" class="modal-backdrop" @click.self="!accountBindingBusy && (accountBindingOpen = false)">
+      <section class="modal credential-modal" role="dialog" aria-modal="true" aria-labelledby="credential-modal-title">
+        <header><div><span class="eyebrow">仅保存在当前设备</span><h2 id="credential-modal-title">绑定北邮账号</h2></div><button class="icon-button" type="button" aria-label="关闭" :disabled="accountBindingBusy" @click="accountBindingOpen = false"><IconGlyph name="close" /></button></header>
+        <p class="credential-disclosure">统一身份认证账号与教务系统账号不同，请分别输入账号和密码；账号和密码会使用系统加密能力保存在本机，仅用于登录校园系统抓取你的数据；可以随时在设置中删除</p>
+        <form @submit.prevent="saveAccountBinding">
+          <fieldset><legend>统一身份认证</legend><label>账号<input v-model="accountBindingForm.ssoAccount" autocomplete="username" placeholder="学工号或统一认证账号" /></label><label>密码<input v-model="accountBindingForm.ssoPassword" type="password" autocomplete="current-password" :placeholder="localSettings.campus.configured ? '留空表示不修改' : '统一身份认证密码'" /></label><small>用于信息门户、第二课堂及需要统一认证的校园服务</small></fieldset>
+          <fieldset><legend>教务系统</legend><label>账号<input v-model="accountBindingForm.jwglAccount" autocomplete="username" placeholder="教务系统账号" /></label><label>密码<input v-model="accountBindingForm.jwglPassword" type="password" autocomplete="current-password" :placeholder="localSettings.campus.configured ? '留空表示不修改' : '教务系统密码'" /></label><small>用于查找并导入当前学生自己的课表</small></fieldset>
+          <p v-if="accountBindingError" class="form-error" role="alert">{{ accountBindingError }}</p>
+          <footer><button class="secondary-button" type="button" :disabled="accountBindingBusy" @click="accountBindingOpen = false">{{ localSettings.campus.configured ? '取消' : '稍后绑定' }}</button><button class="primary-button" type="submit" :disabled="accountBindingBusy">{{ accountBindingBusy ? '正在验证…' : '保存本机凭据' }}</button></footer>
         </form>
       </section>
     </div>
 
-    <div v-if="!profileName" class="welcome-screen"><div ref="welcomeOrbsContainer" class="welcome-orbs" aria-hidden="true"><span v-for="orb in welcomeOrbs" :key="orb.id" :style="{ width: `${orb.radius * 2}px`, height: `${orb.radius * 2}px`, '--orb-hue': String(orb.hue), transform: `translate3d(${orb.x - orb.radius}px, ${orb.y - orb.radius}px, 0)` }" /></div><section class="welcome-card" role="dialog" aria-modal="true" aria-labelledby="welcome-title"><span class="brand-mark">邮</span><span class="eyebrow">北邮人的学习与生活助手</span><h1 id="welcome-title">欢迎使用邮学伴</h1><p>课程、任务、校园信息和 AI 助手都在这里。开始前，想先知道该怎么称呼你。</p><form @submit.prevent="completeWelcome"><label for="welcome-name">你的称呼</label><input id="welcome-name" v-model="welcomeName" autofocus maxlength="20" placeholder="例如：小林、林同学" @input="welcomeError = ''" /><small v-if="welcomeError" class="form-error" role="alert">{{ welcomeError }}</small><button class="primary-button" type="submit">开始使用</button></form><small>称呼只保存在这台设备中，可随时清除。</small></section></div>
+    <div v-if="aiConfigOpen" class="modal-backdrop" @click.self="!aiConfigBusy && (aiConfigOpen = false)">
+      <section class="modal credential-modal" role="dialog" aria-modal="true" aria-labelledby="ai-config-title">
+        <header><div><span class="eyebrow">本机模型配置</span><h2 id="ai-config-title">配置学习助手</h2></div><button class="icon-button" type="button" aria-label="关闭" :disabled="aiConfigBusy" @click="aiConfigOpen = false"><IconGlyph name="close" /></button></header>
+        <p class="credential-disclosure">当前仅支持 DeepSeek 官方 API；只有完成配置后，助手才会向 DeepSeek 发送请求；API Key 使用系统加密能力保存在本机，可随时在设置中修改或删除</p>
+        <form @submit.prevent="saveAiConfig">
+          <label>DeepSeek API URL<input v-model="aiConfigForm.baseUrl" inputmode="url" readonly aria-readonly="true" /></label>
+          <label>DeepSeek API Key<input v-model="aiConfigForm.apiKey" type="password" autocomplete="off" :placeholder="localSettings.ai.configured ? '留空表示不修改' : '请输入 DeepSeek API Key'" /></label>
+          <label v-if="aiModels.length">可用模型<select v-model="aiConfigForm.model"><option v-for="model in aiModels" :key="model" :value="model">{{ model }}</option></select></label>
+          <div class="model-detect-row"><span>{{ aiModels.length ? `当前支持 ${aiModels.length} 个 DeepSeek 模型` : '正在读取受支持模型' }}</span></div>
+          <p v-if="aiConfigError" class="form-error" role="alert">{{ aiConfigError }}</p>
+          <footer><button class="secondary-button" type="button" :disabled="aiConfigBusy" @click="aiConfigOpen = false">{{ localSettings.ai.configured ? '取消' : '暂不配置' }}</button><button class="primary-button" type="submit" :disabled="aiConfigBusy">{{ aiConfigBusy ? '正在保存…' : '保存配置' }}</button></footer>
+        </form>
+      </section>
+    </div>
+
+
+    <div v-if="!profileName" class="welcome-screen"><div ref="welcomeOrbsContainer" class="welcome-orbs" aria-hidden="true"><span v-for="orb in welcomeOrbs" :key="orb.id" :style="{ width: `${orb.radius * 2}px`, height: `${orb.radius * 2}px`, '--orb-hue': String(orb.hue), transform: `translate3d(${orb.x - orb.radius}px, ${orb.y - orb.radius}px, 0)` }" /></div><section class="welcome-card" role="dialog" aria-modal="true" aria-labelledby="welcome-title"><span class="brand-mark">邮</span><span class="eyebrow">北邮人的学习与生活助手</span><h1 id="welcome-title">欢迎使用邮学伴</h1><p>课程、任务、校园信息和 AI 助手都在这里；开始前，想先知道该怎么称呼你</p><form @submit.prevent="completeWelcome"><label for="welcome-name">你的称呼</label><input id="welcome-name" v-model="welcomeName" autofocus maxlength="20" placeholder="例如：小林、林同学" @input="welcomeError = ''" /><small v-if="welcomeError" class="form-error" role="alert">{{ welcomeError }}</small><button class="primary-button" type="submit">开始使用</button></form><small>称呼只保存在这台设备中，可随时清除</small></section></div>
 
     <Transition name="toast"><div v-if="toast" class="toast" role="status"><IconGlyph name="check" />{{ toast }}</div></Transition>
   </div>

@@ -59,6 +59,7 @@ export function cleanImportedCourseName(value: string): string {
     .replace(/\\u00a0/gi, " ")
     .replace(/\u00a0/g, " ")
     .replace(/\s+/g, " ")
+    .replace(/^[-－—–]+\s*/, "")
     .trim();
 }
 

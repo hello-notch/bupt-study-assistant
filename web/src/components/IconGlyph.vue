@@ -50,6 +50,7 @@ defineProps<{ name: string; size?: number }>();
     <template v-else-if="name === 'chevron-left'"><path d="m15 18-6-6 6-6" /></template>
     <template v-else-if="name === 'chevron-right'"><path d="m9 18 6-6-6-6" /></template>
     <template v-else-if="name === 'trash'"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3" /></template>
+    <template v-else-if="name === 'edit'"><path d="m4 16 10-10 4 4L8 20H4v-4Z" /><path d="m13 7 4 4" /></template>
     <template v-else-if="name === 'upload'"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5" /></template>
     <template v-else-if="name === 'send'"><path d="m22 2-7 20-4-9-9-4 20-7Z" /><path d="M22 2 11 13" /></template>
     <template v-else-if="name === 'close'"><path d="m6 6 12 12M18 6 6 18" /></template>

@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["vite.config.ts", "dev-api.ts"]
+  "include": ["vite.config.ts", "dev-api.ts", "src/texts.ts"]
 }

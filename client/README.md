@@ -1,41 +1,23 @@
 # 邮学伴桌面客户端
 
-客户端使用 Electron 加载 `web/dist`，不包含 NoneBot、NapCat 或任何校园凭据。它只是桌面窗口和安全的前端运行壳，在线账号、模型和校园数据由服务端处理。
+Electron 客户端加载包内 `web/dist`，并通过 `preload.cjs` 暴露最小 IPC 接口。`local-runtime.cjs` 在主进程中直接访问校园系统与用户指定的 OpenAI 兼容模型服务；不需要邮学伴服务端。
 
-## 一键运行
+Windows 包只携带 Playwright SDK，不内置 Chromium。北邮统一认证当前会拒绝 Electron 内核的登录请求，因此信息门户或电费会话失效时，客户端会按顺序寻找 Playwright 缓存和常见 Chrome/Edge 安装；都不存在时才自动下载 Chromium，完成后打开隔离浏览器并继续本机查询。统一认证密码、Cookie 和浏览器配置不会上传到邮学伴服务器；会话 Cookie 与账号配置一起由 `safeStorage` 加密保存。
 
-在项目根目录先双击 `run-server.cmd`，看到 `http://127.0.0.1:8787/` 后，再双击 `run-client.cmd`。服务端入口会加载现有完整校园与 AI 代理，不使用仅有占位接口的独立服务端原型。
-
-首次运行前分别安装 `web/` 和 `client/` 依赖。也可以手工运行：
-
-在项目根目录先构建前端：
+校园账号、教务账号、密码、API URL、API Key 和默认模型使用 Electron `safeStorage` 加密保存到当前用户数据目录。渲染页面只能读取配置状态、账号名、URL 和模型名，无法读取密码或 API Key。删除校园配置时会同时清除独立校园会话分区。
 
 ```powershell
-cd .\web
-Copy-Item .\client-config.example .\.env
-.\node_modules\.bin\vite.cmd build
+cd ..\web
+pnpm run build
 cd ..\client
 pnpm install
 pnpm start
 ```
 
-开发模式默认连接 `http://127.0.0.1:8787`。当前 Windows 内测包连接本机的非临时公网 IPv6 地址 `http://[2001:da8:215:8f02:7f5b:8f99:8107:90c3]:8787`，服务端入口会监听 IPv6。测试设备也必须支持 IPv6，且本机防火墙和上游网络需要允许 TCP 8787 入站。地址变化时，需要同时修改 `main.cjs` 的 `packagedAppUrl` 和 `web/.env` 的 `VITE_API_BASE_URL`，再重新打包。长期发布应换成带 AAAA 记录的稳定 HTTPS 域名。
-
-## 打包 Windows 发布版
-
-确认服务端地址后，在 `client/` 目录执行：
+构建 Windows 1.0.1 完整依赖版：
 
 ```powershell
 pnpm run dist:win
 ```
 
-产物位于 `client/dist/win-unpacked/`。分发时请把整个 `win-unpacked` 文件夹压缩后发送给测试用户；解压后双击 `邮学伴.exe` 即可，旁边的 DLL 和资源目录不能单独删除。当前包是未签名构建，Windows SmartScreen 可能显示未知发布者；正式公开发布前建议购买代码签名证书并通过 HTTPS 提供服务。
-
-开发时可以先启动 Vite，再设置：
-
-```powershell
-$env:YOUXUEBAN_CLIENT_URL = "http://127.0.0.1:5173"
-pnpm start
-```
-
-窗口启用沙箱和上下文隔离，禁止网页直接访问 Node.js 文件系统。外部校园链接会交给系统浏览器打开。
+产物为 `client/dist/YouXueBan-1.0.1-Windows-x64-full.zip`。压缩包包含完整的 Electron 运行库、网页资源和 Playwright SDK，不要单独复制 `邮学伴.exe`。当前没有商业代码签名证书，SmartScreen 可能显示未知发布者。

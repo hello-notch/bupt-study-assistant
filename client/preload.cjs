@@ -1,7 +1,6 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld("youxuebanCredentials", {
-  load: () => ipcRenderer.invoke("youxueban:credentials:load"),
-  save: (value) => ipcRenderer.invoke("youxueban:credentials:save", value),
-  clear: () => ipcRenderer.invoke("youxueban:credentials:clear"),
+contextBridge.exposeInMainWorld("youxuebanRuntime", {
+  request: (route, init) => ipcRenderer.invoke("youxueban:runtime:request", route, init),
+  notify: (title, body) => ipcRenderer.invoke("youxueban:notify", title, body),
 });

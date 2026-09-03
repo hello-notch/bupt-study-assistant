@@ -39,7 +39,6 @@ export interface CampusItem {
   publishedAt: string;
   campus?: string;
   eventTime?: string;
-  subscribed: boolean;
   read: boolean;
 }
 
@@ -116,6 +115,7 @@ export interface Preferences {
   semesterStart: string;
   quietStart: string;
   quietEnd: string;
+  soundNotifications: boolean;
   browserNotifications: boolean;
   memoryEnabled: boolean;
   analyticsEnabled: boolean;

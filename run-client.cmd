@@ -10,10 +10,9 @@ if not exist "%ELECTRON_CMD%" (
     exit /b 1
 )
 
-set "YOUXUEBAN_CLIENT_URL=http://127.0.0.1:8787"
 echo.
 echo Starting YouXueBan client...
-echo Make sure run-server.cmd is already running.
+echo Campus accounts and model settings stay on this device.
 echo.
 cd /d "%PROJECT_ROOT%client"
 call "%ELECTRON_CMD%" "."
