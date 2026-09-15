@@ -1,53 +1,30 @@
-const { app, BrowserWindow, ipcMain, Menu, safeStorage, shell } = require("electron");
-const fs = require("node:fs");
+const { app, BrowserWindow, ipcMain, Menu, Notification, safeStorage, session, shell } = require("electron");
 const path = require("node:path");
+const { createLocalRuntime } = require("./local-runtime.cjs");
 
 const devUrl = process.env.YOUXUEBAN_CLIENT_URL || "";
-const packagedAppUrl = "http://[2001:da8:215:8f02:7f5b:8f99:8107:90c3]:8787";
 const distEntry = app.isPackaged
   ? path.join(__dirname, "web", "dist", "index.html")
   : path.resolve(__dirname, "..", "web", "dist", "index.html");
 
-function credentialPath() {
-  return path.join(app.getPath("userData"), "saved-login.bin");
-}
+app.disableHardwareAcceleration();
 
-function readSavedLogin() {
-  try {
-    if (!safeStorage.isEncryptionAvailable() || !fs.existsSync(credentialPath())) return null;
-    const decrypted = safeStorage.decryptString(fs.readFileSync(credentialPath()));
-    const value = JSON.parse(decrypted);
-    return typeof value?.nickname === "string" && typeof value?.password === "string"
-      ? { nickname: value.nickname, password: value.password }
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeSavedLogin(value) {
-  if (!safeStorage.isEncryptionAvailable()) throw new Error("当前系统无法安全保存登录信息");
-  const nickname = String(value?.nickname || "");
-  const password = String(value?.password || "");
-  if (!nickname || !password) throw new Error("登录信息不完整");
-  fs.mkdirSync(path.dirname(credentialPath()), { recursive: true });
-  fs.writeFileSync(credentialPath(), safeStorage.encryptString(JSON.stringify({ nickname, password })));
-}
-
-function clearSavedLogin() {
-  try {
-    if (fs.existsSync(credentialPath())) fs.rmSync(credentialPath());
-  } catch {
-    // The login flow remains usable even if an already inaccessible credential file cannot be removed.
-  }
-}
-
-ipcMain.handle("youxueban:credentials:load", () => readSavedLogin());
-ipcMain.handle("youxueban:credentials:save", (_event, value) => writeSavedLogin(value));
-ipcMain.handle("youxueban:credentials:clear", () => clearSavedLogin());
+const localRuntime = createLocalRuntime({ app, BrowserWindow, safeStorage, session });
+ipcMain.handle("youxueban:runtime:request", (_event, route, init) => localRuntime.request(String(route || ""), init));
+ipcMain.handle("youxueban:notify", (_event, title, body) => {
+  if (!Notification.isSupported()) return false;
+  new Notification({
+    title: String(title || "邮学伴提醒").slice(0, 80),
+    body: String(body || "").slice(0, 500),
+    icon: path.join(__dirname, "resources", "app-icon.png"),
+    silent: false,
+  }).show();
+  return true;
+});
 
 function createWindow() {
   const window = new BrowserWindow({
+    title: "邮学伴 1.0.1",
     width: 1280,
     height: 820,
     minWidth: 960,
@@ -59,18 +36,29 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      backgroundThrottling: false,
       preload: path.join(__dirname, "preload.cjs"),
     },
   });
   window.setMenuBarVisibility(false);
   window.once("ready-to-show", () => window.show());
+  window.webContents.once("did-finish-load", () => window.show());
+  const showTimer = setTimeout(() => {
+    if (!window.isDestroyed()) window.show();
+  }, 3000);
+  window.once("closed", () => clearTimeout(showTimer));
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
-  const appUrl = devUrl || (app.isPackaged ? packagedAppUrl : "");
-  if (appUrl) window.loadURL(appUrl);
-  else window.loadFile(distEntry);
+  const loadPromise = devUrl ? window.loadURL(devUrl) : window.loadFile(distEntry);
+  loadPromise.catch((error) => {
+    if (window.isDestroyed()) return;
+    const detail = String(error?.message || error);
+    const errorPage = `<!doctype html><meta charset="utf-8"><title>邮学伴启动失败</title><style>body{font-family:system-ui;background:#eef4fa;color:#17324d;display:grid;place-items:center;min-height:100vh;margin:0}.card{max-width:560px;background:white;padding:32px;border-radius:20px;box-shadow:0 16px 48px #17324d22}h1{margin-top:0}code{word-break:break-all}</style><main class="card"><h1>邮学伴启动失败</h1><p>本地页面未能加载，请重新安装完整客户端</p><code>${detail.replace(/[&<>]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[character])}</code></main>`;
+    window.loadURL(`data:text/html;charset=UTF-8,${encodeURIComponent(errorPage)}`);
+    window.show();
+  });
 }
 
 app.whenReady().then(() => {

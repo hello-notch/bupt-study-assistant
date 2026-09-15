@@ -35,11 +35,17 @@ export interface CampusItem {
   category: string;
   title: string;
   summary: string;
+  detailHtml?: string;
+  detailError?: string;
   source: string;
   publishedAt: string;
   campus?: string;
   eventTime?: string;
-  subscribed: boolean;
+  eventEndTime?: string;
+  registrationStartTime?: string;
+  registrationEndTime?: string;
+  activityStatus?: string[];
+  registrationFull?: boolean;
   read: boolean;
 }
 
@@ -116,6 +122,7 @@ export interface Preferences {
   semesterStart: string;
   quietStart: string;
   quietEnd: string;
+  soundNotifications: boolean;
   browserNotifications: boolean;
   memoryEnabled: boolean;
   analyticsEnabled: boolean;

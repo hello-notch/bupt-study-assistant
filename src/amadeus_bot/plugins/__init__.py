@@ -1,1 +1,0 @@
-"""NoneBot plugin entry points."""
