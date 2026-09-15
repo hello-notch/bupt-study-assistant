@@ -2,6 +2,16 @@
 
 本文是 `bupt_study_assistant` 的项目级开发说明，供开发者和代码代理共同使用。目标是让项目能够脱离任何本机父目录独立开发、测试、演示和发布。
 
+## 桌面模式更新（优先于下方历史说明）
+
+- 仅支持 Electron 桌面应用；`web/` 保留为桌面 UI 源码。
+- 已移除 `run-web.cmd`、`run-web.ps1`、`web/dev-api.ts`、`.env.example` 和 `config/ai_routes.toml`。下方涉及浏览器适配器的说明不再适用。
+- 首次执行 `pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir client install --frozen-lockfile`。
+- 根目录 `run-client.cmd` 调用 `scripts/start-client.cjs`，先类型检查和构建，再打开 Electron。没有网页服务器，不生成发布包；用户要求验收时保留桌面窗口。
+- 回归命令：`pnpm --dir client test`，包含文件与教务导入的分周课程一致性测试。
+- 导入保存与预览更新计数统一使用 `isSameCourseSession`；周次、教师、地点不同的安排不能互相覆盖。
+- `.env`、`secrets/`、`data/`、`logs/` 中本机资料不再是桌面依赖，但不得自动删除。
+
 ## 1. 项目定位与边界
 
 - 项目根目录：当前 Git 仓库根目录。

@@ -18,13 +18,13 @@
 
 ```text
 bupt_study_assistant/
-├─ web/                         Vue 3 + TypeScript 页面与本地开发适配器
+├─ web/                         桌面应用的 Vue 3 + TypeScript 页面
 ├─ client/                      Electron 桌面壳与设备内运行时
 │  ├─ local-runtime.cjs         校园、课表、电费和模型直连逻辑
 │  └─ main.cjs / preload.cjs    安全 IPC 边界
-├─ config/                      浏览器开发态的无凭据模型路由
 ├─ docs/                        当前架构和发布文档
-└─ scripts/                     图标等本地构建辅助脚本
+├─ scripts/                     桌面启动、课表回归测试与图标工具
+└─ run-client.cmd               构建源码并直接打开桌面应用
 ```
 
 历史 NoneBot 代码、运行数据和 NapCat 不属于桌面客户端。QQ 机器人版本已独立维护在
@@ -32,41 +32,44 @@ bupt_study_assistant/
 
 ## 开发与运行
 
-网页开发模式：
+首次准备（需要 Node.js 22 和 pnpm）：
 
 ```powershell
-cd .\web
-pnpm install
-pnpm run dev
+pnpm --dir web install --frozen-lockfile
+pnpm --dir client install --frozen-lockfile
 ```
 
-网页开发模式不会在浏览器中保存密码或 API Key；校园与模型能力可继续从本机已忽略的 `.env` / `secrets/` 调试配置读取。正式本机配置流程应通过 Electron 客户端验证。
-
-桌面客户端：
+双击根目录 `run-client.cmd`，或运行：
 
 ```powershell
-cd .\web
-pnpm run build
-cd ..\client
-pnpm install
-pnpm start
+.\run-client.cmd
 ```
 
-也可在项目根目录双击 `run-client.cmd`。不再需要 `run-server.cmd`、远程 API 地址或自签名服务器证书。
+启动器每次先检查类型并重新构建页面，再打开 Electron 桌面窗口，不启动网页服务器，也不生成发布包。缺少依赖或构建失败时显示错误，双击启动时窗口会保留供查看。修改源码后关闭测试窗口、重新运行即可；验收后再执行发布构建。
+
+测试版使用开发客户端自己的本机用户目录，不自动迁移已安装版本的数据；首次可能需要填写昵称和重新绑定校园账号。不要同时打开多个源码测试窗口。
+
+已移除旧 `run-web.cmd`、`run-web.ps1`、`web/dev-api.ts` 及网页专用配置模板。`web/` 仍是桌面 UI 源码，不能删除。本机 `.env`、`secrets/`、`data/`、`logs/` 保留但不再是桌面依赖；不会自动删除其中的个人资料。
+
+课表导入按课程名、星期、起止节次、周次、教师与地点识别同一安排。同名同时段的分周授课分别保留；重复导入相同安排不会新增副本。旧版已漏掉的课程需要重新导入原课表。
 
 ## 构建
 
-Windows 1.0.1 完整依赖版：
+当前发布版本为 `1.1.0`。
+
+Windows 1.1.0 完整依赖版：
 
 ```powershell
 cd .\client
 pnpm run dist:win
 ```
 
-产物为 `client/dist/YouXueBan-1.0.1-Windows-x64-full.zip`，压缩包内包含 `邮学伴.exe`、Electron 运行库、网页资源和 Playwright SDK，不需要另装 Node.js。认证会话失效时会优先寻找本机 Chromium，找不到才自动下载。
+产物为 `client/dist/YouXueBan-1.1.0-Windows-x64-full.zip`，压缩包内包含 `邮学伴.exe`、Electron 运行库、网页资源和 Playwright SDK，不需要另装 Node.js。认证会话失效时会优先寻找本机 Chromium，找不到才自动下载。完整更新记录见 [`docs/release-1.1.0.md`](docs/release-1.1.0.md)。
 
 
 ## 验证
+
+运行 `pnpm --dir client test` 验证本地运行时和两种课表导入的分周保留规则。
 
 ```powershell
 cd .\web

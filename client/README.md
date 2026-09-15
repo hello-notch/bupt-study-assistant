@@ -7,12 +7,12 @@ Windows 包只携带 Playwright SDK，不内置 Chromium。北邮统一认证当
 校园账号、教务账号、密码、API URL、API Key 和默认模型使用 Electron `safeStorage` 加密保存到当前用户数据目录。渲染页面只能读取配置状态、账号名、URL 和模型名，无法读取密码或 API Key。删除校园配置时会同时清除独立校园会话分区。
 
 ```powershell
-cd ..\web
-pnpm run build
-cd ..\client
-pnpm install
+pnpm --dir ../web install --frozen-lockfile
+pnpm install --frozen-lockfile
 pnpm start
 ```
+
+`pnpm start` 或根目录 `run-client.cmd` 会检查类型、构建当前源码并打开桌面窗口，不生成发布包。修改后关闭窗口并重新启动即可验收。
 
 构建 Windows 1.0.1 完整依赖版：
 

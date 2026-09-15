@@ -9,11 +9,12 @@
 ```text
 Vue 页面
   │  apiFetch（统一 API 形状，不持有敏感值）
-  ├─ Windows preload IPC ── Electron local-runtime.cjs
-  └─ 浏览器开发态 ── Vite dev-api.ts（仅本机调试）
+  └─ Windows preload IPC ── Electron local-runtime.cjs
 ```
 
 渲染页面只接收配置状态、脱敏账号、API URL、模型名和业务结果。密码、API Key、Cookie 与 token 不进入 `localStorage`、页面状态或控制台。
+
+仅保留桌面运行路径。根目录 `run-client.cmd` 从源码构建 `web/dist` 后直接打开 Electron，供发布前验收；Vite 仅负责页面构建，不再配置浏览器业务 API 适配器。
 
 ## 本机数据
 
@@ -32,7 +33,9 @@ Vue 页面
 
 - 教务：保存账号后不自动读取课表；课程页可按需读取当前学生个人课表，或从 XLS/XLSX/CSV 文件导入。
 - 信息门户：读取通知列表与门户首页“待办中心”；待办中心条目优先进入“今天”，所有条目保留具体 URL。
-- 第二课堂：只读活动查询。成功空数组表示当前无活动，不视为失败。
+- 第二课堂：只读查询学生端 `/api/v1/activity`，必填筛选参数 `college_id`、`grade`、`class_id`、`role_id` 均以 `0` 查询未限制的校园活动。不得使用 `/api/v1/participation/admin/act`，该接口只返回当前用户管理的活动。使用 `activity_start_time` 和 `area` / `location` 展示时间及地点；同时校验 HTTP、`x-real-status` 和业务响应结构。成功空数组表示当前无活动，鉴权、业务或解析失败保留真实缓存，不得降为成功空列表。
+- 第二课堂列表读取后，以最多四个并发 GET 请求读取 `/api/v1/activity/{id}` 的 `data.detail`；兼容官方 HTML 和 Quill Delta，清理不安全内容后直接展示段落和图片，不打开详情弹窗或生成 AI 摘要。单项详情失败不丢弃列表，保留可用详情缓存并明确标注失败。活动时间统一为北京时间的具体日期与时分。
+- 门户列表以每条 `li` / `tr` 为解析范围，优先使用链接 `title` 获取完整标题、`.author` 获取发布部门；发布时间只显示具体日期，缺失时不虚构日期。通知卡片右上角保留原文链接，标题最多显示四行；AI 摘要在标题下原位生成，独立维护每条通知的加载与重试状态，正文不截断且卡片自动增高，刷新相同标题和链接的通知时保留已有摘要。
 - 电费：仍需用户输入楼宇和宿舍号；设备登录官方电费页面后查询对应楼、层和房间。
 - HTTP 成功不等于业务成功；必须识别登录页、验证码、系统提示页、无效 JSON 和页面结构变化。
 

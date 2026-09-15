@@ -332,17 +332,30 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .campus-service-links small { margin-top: 4px; color: var(--text-secondary); font-size: 9px; }
 .campus-service-links .icon-glyph { flex: 0 0 auto; color: var(--blue); }
 
-.campus-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.campus-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
 .campus-card { position: relative; display: flex; flex-direction: column; min-height: 230px; padding: 17px; overflow: hidden; }
 .campus-card.unread::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--blue); }
 .campus-card-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.page-heading.split > .secondary-button { flex-shrink: 0; white-space: nowrap; }
 .category-chip { display: inline-flex; align-items: center; min-height: 25px; padding: 0 8px; border-radius: 7px; color: var(--blue-strong); background: var(--blue-soft); font-size: 10px; font-weight: 650; }
+.activity-statuses { display: flex; flex-wrap: wrap; gap: 6px; }
+.activity-statuses b { padding: 4px 7px; border: 1px solid var(--blue); border-radius: 5px; color: var(--blue); background: transparent; font-size: 11px; font-weight: 650; }
+.activity-statuses b.full { border-color: #ef5b5b; color: #ef5b5b; }
+.activity-registration { margin-left: auto; text-align: right; max-width: 100%; }
 .subscribe-button { min-height: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-secondary); background: transparent; cursor: pointer; font-size: 10px; }
 .subscribe-button.subscribed { border-color: color-mix(in srgb, var(--blue) 30%, var(--border)); color: var(--blue-strong); background: var(--blue-soft); }
-.campus-content { flex: 1; padding: 14px 0 10px; border: 0; background: transparent; text-align: left; cursor: pointer; }
-.campus-content strong { display: block; font-size: 14px; line-height: 1.6; }
+.campus-content { flex: 1; min-width: 0; padding: 14px 0 10px; border: 0; background: transparent; text-align: left; overflow-wrap: anywhere; }
+.campus-content > strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; font-size: 14px; line-height: 1.6; }
+.campus-original { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; color: var(--blue-strong); font-size: 11px; text-decoration: none; }
+.campus-summary-button { display: flex; align-items: center; gap: 6px; padding: 8px 0; border: 0; background: transparent; color: var(--blue-strong); font: inherit; font-size: 11px; cursor: pointer; text-align: left; }
+.campus-summary { white-space: pre-wrap; }
+.activity-detail { margin-top: 8px; color: var(--text-secondary); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.activity-detail img { max-width: 100%; height: auto; }
+.activity-detail * { max-width: 100%; }
+.activity-detail table { display: block; overflow-x: auto; }
+.campus-card footer { flex-wrap: wrap; overflow-wrap: anywhere; }
 .campus-content p { margin: 8px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.65; }
-.campus-content span { display: flex; align-items: center; gap: 5px; margin-top: 9px; color: var(--text-secondary); font-size: 10px; }
+.campus-content > span { display: flex; align-items: center; gap: 5px; margin-top: 9px; color: var(--text-secondary); font-size: 10px; }
 .campus-card footer { display: flex; justify-content: space-between; gap: 10px; padding-top: 11px; border-top: 1px solid var(--border); color: var(--text-tertiary); font-size: 9px; }
 .campus-load-more { display: flex; justify-content: center; margin-top: 15px; }
 .campus-load-more .secondary-button { min-width: 230px; justify-content: center; text-decoration: none; }
@@ -602,7 +615,8 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .import-course-list { grid-column: 1 / -1; max-height: 210px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
 .import-course-list > span, .import-course-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--text-secondary); font-size: 10px; }
 .import-course-item:last-child { border-bottom: 0; }
-.import-course-item > span { min-width: 0; line-height: 1.5; }
+.import-course-item > span { min-width: 0; line-height: 1.5; overflow-wrap: anywhere; }
+.import-course-item > span > b { display: block; }
 .import-course-item input[type="checkbox"] { width: 17px; height: 17px; min-height: 17px; flex: 0 0 auto; accent-color: var(--blue); cursor: pointer; }
 .import-course-list b { color: var(--text); }
 .import-finish { padding: 18px 0; text-align: center; }
@@ -770,6 +784,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .mobile-course-list strong { font-size: 12px; }
   .mobile-course-list small { margin-top: 5px; color: var(--text-secondary); font-size: 10px; }
   .campus-card { min-height: 210px; }
+  .campus-grid { align-items: stretch; }
   .quick-prompts { flex-wrap: nowrap; margin-right: -14px; overflow-x: auto; padding-right: 14px; scrollbar-width: none; }
   .quick-prompts::-webkit-scrollbar { display: none; }
   .quick-prompts button { flex: 0 0 auto; }

@@ -35,10 +35,17 @@ export interface CampusItem {
   category: string;
   title: string;
   summary: string;
+  detailHtml?: string;
+  detailError?: string;
   source: string;
   publishedAt: string;
   campus?: string;
   eventTime?: string;
+  eventEndTime?: string;
+  registrationStartTime?: string;
+  registrationEndTime?: string;
+  activityStatus?: string[];
+  registrationFull?: boolean;
   read: boolean;
 }
 

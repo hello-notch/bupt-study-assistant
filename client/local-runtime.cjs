@@ -1,6 +1,8 @@
 const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { parseHTML } = require("linkedom");
+const { QuillDeltaToHtmlConverter } = require("quill-delta-to-html");
 const { authenticatePortalWithPlaywright, openCampusServiceWithPlaywright, CampusBrowserSessionExpired } = require("./playwright-auth.cjs");
 
 const PORTAL_LIST_URL = "http://my.bupt.edu.cn/list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1154";
@@ -8,7 +10,7 @@ const PORTAL_HOME_URL = "http://my.bupt.edu.cn/";
 const JWGL_HOME_URL = "https://jwgl.bupt.edu.cn/";
 const JWGL_SCHEDULE_URL = "https://jwgl.bupt.edu.cn/jsxsd/xskb/xskb_list.do";
 const ACTIVITY_URL = "https://dekt.bupt.edu.cn";
-const ACTIVITY_LIST_URL = `${ACTIVITY_URL}/api/v1/participation/admin/act`;
+const ACTIVITY_LIST_URL = `${ACTIVITY_URL}/api/v1/activity`;
 const ELECTRICITY_URL = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
 const DEEPSEEK_API_URL = "https://api.deepseek.com";
 const DEEPSEEK_SUMMARY_MODEL = "deepseek-v4-flash";
@@ -243,10 +245,15 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
     try { url = new URL(String(body?.url || "")); } catch { return bad(400, "通知地址无效"); }
     if (!title || url.hostname !== "my.bupt.edu.cn" || !["http:", "https:"].includes(url.protocol)) return bad(400, "通知地址无效");
     const campus = requireCampusSettings();
-    const cookies = await portalSessionCookies(campus);
-    const response = await fetch(url, { headers: { Cookie: cookieHeaderForUrl(cookies, url.toString()) }, redirect: "follow", signal: AbortSignal.timeout(25_000) });
-    const html = await decodeResponse(response);
-    if (response.url.includes("auth.bupt.edu.cn/authserver/login") || /统一身份认证|authserver\/login/i.test(html)) return bad(401, "信息门户登录已失效，请重新登录");
+    let cookies = await portalSessionCookies(campus);
+    let response = await fetch(url, { headers: { Cookie: cookieHeaderForUrl(cookies, url.toString()) }, redirect: "follow", signal: AbortSignal.timeout(25_000) });
+    let html = await decodeResponse(response);
+    if (response.url.includes("auth.bupt.edu.cn/authserver/login") || /统一身份认证|authserver\/login/i.test(html) || response.status === 401 || response.status === 403) {
+      cookies = await portalSessionCookies(campus, true);
+      response = await fetch(url, { headers: { Cookie: cookieHeaderForUrl(cookies, url.toString()) }, redirect: "follow", signal: AbortSignal.timeout(25_000) });
+      html = await decodeResponse(response);
+      if (response.url.includes("auth.bupt.edu.cn/authserver/login") || /统一身份认证|authserver\/login/i.test(html) || response.status === 401 || response.status === 403) return bad(401, "信息门户登录已失效，请重新登录");
+    }
     if (!response.ok) return bad(502, `信息门户返回 HTTP ${response.status}`);
     const articleText = stripHtml(html).replace(/\s+/g, " ").trim();
     if (articleText.length < 30) return bad(502, "没有从官方页面读取到可总结的正文");
@@ -323,9 +330,19 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
     }
     try {
       const activity = await loadActivities(campus);
+      const previousActivities = new Map(readCampusCache().activity.map((item) => [item.id, item]));
+      for (const item of activity) {
+        const previous = previousActivities.get(item.id);
+        if (item.detailError && previous?.detailHtml) {
+          item.detailHtml = previous.detailHtml;
+          item.summary = previous.summary;
+          item.detailError = "活动详情更新失败，当前显示上次读取的详情，请刷新重试";
+        }
+      }
       items.push(...activity);
       writeCampusCache("activity", activity);
-      statuses.push({ source: "activity", label: "第二课堂", mode: "online", message: activity.length ? `在线读取 ${activity.length} 条` : "在线连接正常，当前没有进行中活动", itemCount: activity.length });
+      const detailFailures = activity.filter((item) => item.detailError).length;
+      statuses.push({ source: "activity", label: "第二课堂", mode: "online", message: activity.length ? `在线读取 ${activity.length} 条${detailFailures ? `，${detailFailures} 条详情暂时无法更新` : ""}` : "在线连接正常，当前没有进行中活动", itemCount: activity.length });
     } catch (error) {
       const cached = readCampusCache().activity;
       items.push(...cached);
@@ -418,25 +435,31 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
         token = await loginActivityInBrowser(campus);
       }
     } else {
-      if (!response.ok) throw new Error(`登录失败（HTTP ${realStatus}）`);
+      if (!response.ok || realStatus >= 400) throw new Error(`登录失败（HTTP ${realStatus}）`);
       const login = await response.json();
       token = activityTokenFromPayload(login);
     }
     if (token.split(".").length !== 3) throw new Error("登录需要验证码或账号密码不正确");
-    const url = new URL(ACTIVITY_LIST_URL);
-    url.searchParams.set("act_state", "0");
-    url.searchParams.set("page", "1");
-    url.searchParams.set("page_size", "50");
-    response = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(25_000) });
-    if (!response.ok) throw new Error(`活动列表接口返回 HTTP ${response.status}`);
-    const payload = await response.json();
-    return activityRows(payload).map(toActivityItem).filter(Boolean);
+    try {
+      return await fetchActivityList(token);
+    } catch (error) {
+      if (!(error instanceof CampusBrowserSessionExpired)) throw error;
+      await session.fromPartition(partitions.activity).clearStorageData({ storages: ["cookies", "localstorage"] });
+      return await fetchActivityList(await loginActivityInBrowser(campus));
+    }
   }
 
   async function loginActivityInBrowser(campus) {
     const window = await createCampusWindow("activity");
     try {
       await loadCampusPage(window, ACTIVITY_URL);
+      // The SPA may still be routing after the document has finished loading.
+      const existingToken = await waitForPageValue(window, `(() => {
+        const token = localStorage.getItem('secondclass.tokenv3') || '';
+        if (token.split('.').length === 3) return token;
+        return document.querySelector('input[type="password"]') ? true : false;
+      })()`, (value) => Boolean(value), 20_000, "第二课堂登录页面未就绪，请稍后重试");
+      if (typeof existingToken === "string") return existingToken;
       const submitted = await window.webContents.executeJavaScript(`(() => {
         const account = document.querySelector('input[placeholder*="学工号"], input[name="username"], input[type="text"]');
         const password = document.querySelector('input[placeholder*="密码"], input[name="password"], input[type="password"]');
@@ -673,15 +696,20 @@ async function decodeResponse(response) {
 }
 
 function parsePortalList(html, baseUrl) {
-  const pattern = /<a[^>]+href=["']([^"']*(?:xntz_content\.jsp|wbnewsid=)[^"']*)["'][^>]*>([\s\S]*?)<\/a>([\s\S]{0,300})/gi;
+  const { document } = parseHTML(html);
   const result = [];
-  for (const match of html.replace(/<script[\s\S]*?<\/script>/gi, "").matchAll(pattern)) {
-    const url = new URL(decodeEntities(match[1]), baseUrl).toString();
-    const title = stripHtml(match[2]);
+  for (const anchor of document.querySelectorAll('a[href*="xntz_content.jsp"], a[href*="wbnewsid="]')) {
+    const url = new URL(anchor.getAttribute("href"), baseUrl).toString();
+    const title = (anchor.getAttribute("title") || anchor.textContent).replace(/\s+/g, " ").trim();
     if (!title) continue;
     const id = /wbnewsid=(\d+)/.exec(url)?.[1] || createHash("sha256").update(url).digest("hex").slice(0, 20);
-    const date = /20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}/.exec(match[3])?.[0]?.replace(/[/.]/g, "-") || new Date().toISOString();
-    result.push({ id, url, kind: "notice", category: "信息门户", title, summary: "", source: "信息门户", publishedAt: date, read: false });
+    const row = anchor.closest("tr, li") || anchor.parentElement;
+    const date = /20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}/.exec(row?.textContent || "")?.[0]?.replace(/[/.]/g, "-") || "";
+    const siblings = [...(row?.querySelectorAll("td, span") || [])].filter((node) => !node.contains(anchor) && !anchor.contains(node));
+    const author = row?.querySelector(".author");
+    const department = (author?.getAttribute("title") || author?.textContent || "").trim() || siblings.map((node) => (node.getAttribute("title") || node.textContent).replace(/\s+/g, " ").trim())
+      .find((text) => text && !/20\d{2}[-/.]\d/.test(text) && !/^\d+$/.test(text) && text !== title && text.length < 100);
+    result.push({ id, url, kind: "notice", category: "信息门户", title, summary: "", source: department || "发布部门未提供", publishedAt: date, read: false });
   }
   return result;
 }
@@ -781,10 +809,120 @@ function decodeEntities(value) { return String(value || "").replace(/&amp;/g, "&
 function dedupeItems(items) { const seen = new Set(); return items.filter((item) => { const key = `${item.kind}:${item.id}`; if (seen.has(key)) return false; seen.add(key); return true; }); }
 
 function activityRows(payload) {
-  if (Array.isArray(payload)) return payload.filter((item) => item && typeof item === "object");
-  if (!payload || typeof payload !== "object") return [];
-  for (const key of ["data", "items", "list", "records", "activities", "result"]) { const rows = activityRows(payload[key]); if (rows.length) return rows; }
-  return [];
+  if (Array.isArray(payload)) {
+    if (payload.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+      throw new Error("活动列表数据格式已变化");
+    }
+    return payload;
+  }
+  if (!payload || typeof payload !== "object") throw new Error("活动列表数据格式已变化");
+  if ((payload.error != null && payload.error !== false && payload.error !== "")
+    || (payload.status != null && !["ok", "success", "200", "0"].includes(String(payload.status)))
+    || payload.success === false
+    || (payload.code != null && ![0, 200].includes(Number(payload.code)))) {
+    throw new Error("活动列表查询失败，请重新登录或稍后重试");
+  }
+  for (const key of ["data", "items", "list", "records", "activities", "result"]) {
+    if (Object.hasOwn(payload, key)) return activityRows(payload[key]);
+  }
+  throw new Error("活动列表数据格式已变化");
+}
+
+async function fetchActivityList(token) {
+  const url = new URL(ACTIVITY_LIST_URL);
+  // The student feed requires all four filters; zero means no restriction.
+  url.search = new URLSearchParams({ college_id: "0", grade: "0", class_id: "0", role_id: "0", page: "1", page_size: "50" }).toString();
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(25_000) });
+  const status = Number(response.headers.get("x-real-status") || response.status);
+  if (status === 401 || status === 403) throw new CampusBrowserSessionExpired("第二课堂登录已失效，请重新登录");
+  if (!response.ok || status >= 400) throw new Error(`活动列表接口返回 HTTP ${status}`);
+  let payload;
+  try { payload = await response.json(); } catch { throw new Error("活动列表没有返回有效数据，请重新登录或稍后重试"); }
+  const rows = activityRows(payload);
+  const items = rows.map(toActivityItem);
+  if (items.some((item) => !item)) throw new Error("活动列表缺少活动编号、名称或时间，请稍后重试");
+  const groups = {};
+  if (rows.some((row) => row.belong_to != null)) {
+    try {
+      const response = await fetch(new URL("/api/v1/group/org-college", ACTIVITY_URL), {
+        headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(25_000),
+      });
+      if (response.ok) for (const group of activityRows(await response.json())) {
+        groups[String(group.id)] = firstValue(group, "name");
+      }
+    } catch { /* Keep activities readable when the organization directory is unavailable. */ }
+    for (let index = 0; index < items.length; index++) {
+      if (groups[String(rows[index].belong_to)]) items[index].source = groups[String(rows[index].belong_to)];
+    }
+  }
+  // Limit concurrent detail requests while preserving list order and partial results.
+  let next = 0;
+  let authError;
+  await Promise.all(Array.from({ length: Math.min(4, items.length) }, async () => {
+    while (next < items.length && !authError) {
+      const index = next++;
+      const item = items[index];
+      try {
+        const detailResponse = await fetch(new URL(`${ACTIVITY_LIST_URL}/${encodeURIComponent(item.id)}`), {
+          headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(25_000),
+        });
+        const detailStatus = Number(detailResponse.headers.get("x-real-status") || detailResponse.status);
+        if (detailStatus === 401 || detailStatus === 403) throw new CampusBrowserSessionExpired("第二课堂登录已失效，请重新登录");
+        if (!detailResponse.ok || detailStatus >= 400) throw new Error("活动详情读取失败，请刷新重试");
+        const envelope = await detailResponse.json();
+        const [detail] = activityRows({ ...envelope, data: [envelope.data] });
+        if (!detail || typeof detail !== "object" || Array.isArray(detail)
+          || !Object.hasOwn(detail, "detail")) throw new Error("活动详情格式已变化，请稍后重试");
+        const detailId = firstValue(detail, "id", "act_id", "activity_id");
+        if (detailId && detailId !== item.id) throw new Error("活动详情编号不匹配");
+        const merged = toActivityItem({ ...rows[index], ...detail });
+        if (merged) Object.assign(item, merged, { source: groups[String(detail.belong_to ?? rows[index].belong_to)] || merged.source });
+        item.detailHtml = activityDetailHtml(detail.detail);
+        item.summary = stripHtml(item.detailHtml);
+      } catch (error) {
+        if (error instanceof CampusBrowserSessionExpired) { authError = error; return; }
+        item.detailError = "活动详情暂时无法读取，请刷新重试";
+      }
+    }
+  }));
+  if (authError) throw authError;
+  return items;
+}
+
+function activityDetailHtml(value) {
+  if (value == null || value === "") return "";
+  let content = value;
+  if (typeof content === "string" && /^\s*[\[{]/.test(content)) content = JSON.parse(content);
+  let html;
+  if (Array.isArray(content) || Array.isArray(content?.ops)) {
+    html = new QuillDeltaToHtmlConverter(Array.isArray(content) ? content : content.ops, {
+      inlineStyles: true,
+      urlSanitizer: (url) => /^\d+\//.test(url) ? `${ACTIVITY_URL}/api/v1/image/${url.replace(/["<>&]/g, (character) => encodeURIComponent(character))}` : undefined,
+    }).convert();
+  } else if (typeof content === "string") {
+    html = content;
+  } else {
+    throw new Error("活动详情格式已变化");
+  }
+  const { document } = parseHTML(`<html><body>${html}</body></html>`);
+  for (const node of document.querySelectorAll("script, style, iframe, object, embed, form, input, button, meta, link, base")) node.remove();
+  for (const node of document.querySelectorAll("*")) {
+    for (const attribute of [...node.attributes]) {
+      if (!["href", "src", "alt", "title", "colspan", "rowspan"].includes(attribute.name)) node.removeAttribute(attribute.name);
+    }
+    for (const attribute of ["href", "src"]) {
+      if (!node.hasAttribute(attribute)) continue;
+      try {
+        const raw = node.getAttribute(attribute);
+        const address = attribute === "src" && /^\d+\//.test(raw) ? `/api/v1/image/${raw}` : raw;
+        const url = new URL(address, ACTIVITY_URL);
+        if (!["http:", "https:"].includes(url.protocol)) node.removeAttribute(attribute);
+        else node.setAttribute(attribute, url.toString());
+      } catch { node.removeAttribute(attribute); }
+    }
+    if (node.localName === "a") { node.setAttribute("target", "_blank"); node.setAttribute("rel", "noopener noreferrer"); }
+  }
+  return document.body.textContent.trim() || document.querySelector("img") ? document.body.innerHTML : "";
 }
 
 function activityTokenFromPayload(payload) {
@@ -801,8 +939,36 @@ function toActivityItem(row) {
   const id = firstValue(row, "activity_id", "act_id", "id", "活动ID");
   const title = firstValue(row, "name", "title", "activity_name", "act_name", "活动名称");
   if (!id || !title) return null;
-  const time = firstValue(row, "start_time", "activity_time", "begin_at", "活动时间") || new Date().toISOString();
-  return { id, url: firstValue(row, "url", "link", "详情链接") || ACTIVITY_URL, kind: "activity", category: firstValue(row, "category", "class_name", "type", "类别") || "第二课堂", title, summary: firstValue(row, "summary", "description", "简介"), source: firstValue(row, "organizer", "department", "主办方") || "第二课堂", publishedAt: time, eventTime: time, campus: firstValue(row, "campus", "校区", "location", "address", "地点"), read: false };
+  const time = firstValue(row, "activity_start_time", "start_time", "activity_time", "begin_at", "活动时间");
+  const endTime = firstValue(row, "activity_end_time", "end_time", "finish_at", "结束时间");
+  if (!time || !Number.isFinite(Date.parse(time))) return null;
+  const area = ({ 0: "西土城校区", 1: "沙河校区" })[row.area] || "";
+  const campus = firstValue(row, "campus", "校区") || [area, firstValue(row, "location", "address", "地点")].filter(Boolean).join(" ");
+  const demands = row.demands != null && String(row.demands).trim() !== "" && Number.isInteger(Number(row.demands)) && Number(row.demands) >= 0 ? Number(row.demands) : null;
+  const registrationRequired = demands === null ? activityFlag(row, ["need_signup", "need_registration", "need_register"]) : Boolean(demands & 1);
+  const checkinRequired = demands === null ? activityFlag(row, ["need_checkin", "require_checkin"]) : Boolean(demands & 2);
+  const checkoutRequired = demands === null ? activityFlag(row, ["need_checkout", "require_checkout"]) : Boolean(demands & 4);
+  const full = registrationRequired === true && Number(row.attend_limit) > 0 && Number(row.attend_count) >= Number(row.attend_limit);
+  const status = [];
+  status.push(registrationRequired === null ? "报名状态未知" : registrationRequired ? "需报名" : "不报名");
+  status.push(checkinRequired === null ? "签到状态未知" : checkinRequired ? "需签到" : "不签到");
+  status.push(checkoutRequired === null ? "签退状态未知" : checkoutRequired ? "需签退" : "不签退");
+  if (full) status.push("人数已满");
+  return { id, url: firstValue(row, "url", "link", "详情链接") || ACTIVITY_URL, kind: "activity", category: firstValue(row, "category", "class_name", "type", "类别") || "第二课堂", title, summary: firstValue(row, "summary", "description", "简介"), source: firstValue(row, "organizer", "organizer_name", "department", "sponsor", "sponsor_name", "主办单位", "主办方", "发出方") || "未提供主办方", publishedAt: time, eventTime: time, eventEndTime: endTime || undefined, registrationStartTime: firstValue(row, "register_start_time", "registration_start_time", "signup_start_time", "报名开始时间"), registrationEndTime: firstValue(row, "register_end_time", "registration_end_time", "signup_end_time", "报名结束时间"), activityStatus: status, registrationFull: full, campus, read: false };
+}
+
+function activityFlag(row, keys) {
+  for (const key of keys) {
+    if (!Object.hasOwn(row || {}, key)) continue;
+    const value = row[key];
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value > 0;
+    const normalized = String(value ?? "").trim().toLowerCase();
+    if (!normalized) continue;
+    if (["1", "true", "yes", "y", "on", "required", "need", "needed", "是", "需要", "需"].includes(normalized)) return true;
+    if (["0", "false", "no", "n", "off", "none", "not_required", "否", "不需要", "不需"].includes(normalized)) return false;
+  }
+  return null;
 }
 
 function parseDormitory(value) {
@@ -848,5 +1014,5 @@ function bad(status, error) { return { status, body: { error } }; }
 
 module.exports = {
   createLocalRuntime,
-  __test: { activityRows, activityTokenFromPayload, cookieHeaderForUrl, dataRows, electricityData, houseMatches, normalizeScheduleCourseName, normalizeScheduleWeeks, parseDormitory, parsePersonalSchedule, parseScheduleLines, portalPaginationUrls, roomMatches },
+  __test: { activityDetailHtml, parsePortalList, activityRows, activityTokenFromPayload, fetchActivityList, toActivityItem, cookieHeaderForUrl, dataRows, electricityData, houseMatches, normalizeScheduleCourseName, normalizeScheduleWeeks, parseDormitory, parsePersonalSchedule, parseScheduleLines, portalPaginationUrls, roomMatches },
 };

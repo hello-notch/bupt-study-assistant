@@ -67,6 +67,223 @@ test("activity rows accept the current nested list response", () => {
   assert.deepEqual(__test.activityRows({ data: [] }), []);
 });
 
+const activityFixture = [
+  { id: 101, name: "Lecture", activity_start_time: "2026-09-21T01:30:00Z", area: 0, location: "Hall" },
+  { id: 102, name: "Film", activity_start_time: "2026-09-16T06:00:00Z", area: 1, location: "Cinema" },
+  { id: 103, name: "Careers", activity_start_time: "2026-09-17T06:00:00Z", area: 0, location: "Room 101" },
+];
+
+test("official demands bitmask preserves all combinations and unknown fields", () => {
+  for (let demands = 0; demands < 8; demands++) {
+    const item = __test.toActivityItem({ ...activityFixture[0], demands: String(demands) });
+    assert.deepEqual(item.activityStatus, [
+      demands & 1 ? "需报名" : "不报名",
+      demands & 2 ? "需签到" : "不签到",
+      demands & 4 ? "需签退" : "不签退",
+    ]);
+  }
+  assert.deepEqual(__test.toActivityItem(activityFixture[0]).activityStatus, ["报名状态未知", "签到状态未知", "签退状态未知"]);
+  assert.equal(__test.toActivityItem({ ...activityFixture[0], demands: 7, attend_count: 20, attend_limit: 20 }).registrationFull, true);
+  assert.equal(__test.toActivityItem({ ...activityFixture[0], demands: 7, attend_count: 20, attend_limit: 0 }).registrationFull, false);
+  assert.equal(__test.toActivityItem({ ...activityFixture[0], demands: 0, attend_count: 20, attend_limit: 20 }).registrationFull, false);
+});
+
+test("official organization directory and detail metadata are merged into activity cards", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url.pathname === "/api/v1/group/org-college") return Response.json({ data: [{ id: 12, name: "校团委" }] });
+    if (url.pathname === "/api/v1/activity") return Response.json({ data: [{ ...activityFixture[0], belong_to: 12 }] });
+    return Response.json({ data: { id: 101, demands: 7, attend_count: 100, attend_limit: 100,
+      signup_start_time: "2026-09-15T08:00:00Z", signup_end_time: "2026-09-20T08:00:00Z", detail: "<p>Official</p>" } });
+  };
+  try {
+    const [item] = await __test.fetchActivityList("test-token");
+    assert.equal(item.source, "校团委");
+    assert.deepEqual(item.activityStatus, ["需报名", "需签到", "需签退", "人数已满"]);
+    assert.equal(item.registrationStartTime, "2026-09-15T08:00:00Z");
+    assert.equal(item.registrationEndTime, "2026-09-20T08:00:00Z");
+  } finally { global.fetch = originalFetch; }
+});
+
+test("student activity feed uses the required filters and preserves all three activities", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    assert.equal(url.origin, "https://dekt.bupt.edu.cn");
+    assert.equal(init.headers.Authorization, "Bearer test-token");
+    if (url.pathname !== "/api/v1/activity") {
+      const id = Number(url.pathname.split("/").pop());
+      assert.ok(activityFixture.some((row) => row.id === id));
+      return new Response(JSON.stringify({ status: "ok", data: { id, detail: `<p>Official detail ${id}</p>` }, error: null }));
+    }
+    assert.deepEqual(Object.fromEntries(url.searchParams), {
+      college_id: "0", grade: "0", class_id: "0", role_id: "0", page: "1", page_size: "50",
+    });
+    return new Response(JSON.stringify({ status: "ok", data: activityFixture, digest: [], error: null }));
+  };
+  try {
+    const items = await __test.fetchActivityList("test-token");
+    assert.deepEqual(items.map((item) => item.id), ["101", "102", "103"]);
+    assert.equal(items[0].eventTime, "2026-09-21T01:30:00Z");
+    assert.equal(items[0].campus, "西土城校区 Hall");
+    assert.equal(items[1].campus, "沙河校区 Cinema");
+    assert.equal(items[0].kind, "activity");
+    assert.equal(items[0].publishedAt, items[0].eventTime);
+    assert.equal(items[0].summary, "Official detail 101");
+    assert.equal(items[0].detailHtml, "<p>Official detail 101</p>");
+  } finally { global.fetch = originalFetch; }
+});
+
+test("portal keeps the full title, department and date from the same list row", () => {
+  const rows = `<ul><li><span>教务处</span><a href="xntz_content.jsp?wbnewsid=1" title="完整的通知标题">完整的通...</a><span>2026-09-15</span></li>
+    <li><span title="学生工作部（处）">学生工作...</span><a href="xntz_content.jsp?wbnewsid=2">另一条通知</a><span>2026/09/14</span></li></ul>`;
+  const items = __test.parsePortalList(rows, "http://my.bupt.edu.cn/");
+  assert.equal(items[0].title, "完整的通知标题");
+  assert.equal(items[0].source, "教务处");
+  assert.equal(items[0].publishedAt, "2026-09-15");
+  assert.equal(items[1].source, "学生工作部（处）");
+  assert.equal(items[1].publishedAt, "2026-09-14");
+  const missing = __test.parsePortalList('<li><a href="xntz_content.jsp?wbnewsid=3">无日期通知</a></li>', "http://my.bupt.edu.cn/")[0];
+  assert.equal(missing.publishedAt, "");
+  assert.equal(missing.source, "发布部门未提供");
+  const liveShape = '<ul class="newslist list-unstyled"><li><a href="xntz_content.jsp?wbnewsid=142172" title="关于开展2026-2027学年学生社团注册工作的通知">关于开展2026-2027学年...</a><span class="author">校团委</span><span class="time">2026-09-15</span></li></ul>';
+  const [official] = __test.parsePortalList(liveShape, "http://my.bupt.edu.cn/");
+  assert.equal(official.title, "关于开展2026-2027学年学生社团注册工作的通知");
+  assert.equal(official.source, "校团委");
+  assert.equal(official.publishedAt, "2026-09-15");
+});
+
+test("activity details preserve paragraphs and images and remove unsafe HTML", () => {
+  const delta = JSON.stringify([{ insert: "第一段\n第二段\n" }, { insert: { image: "https://dekt.bupt.edu.cn/static/image.png" } }]);
+  const html = __test.activityDetailHtml(delta);
+  assert.match(html, /第一段/);
+  assert.match(html, /第二段/);
+  assert.match(html, /<img/);
+  const sanitized = __test.activityDetailHtml('<p onclick="bad()">官方详情</p><script>bad()</script><img src="/static/x.png" onerror="bad()"><a href="javascript:bad()">链接</a>');
+  assert.doesNotMatch(sanitized, /onclick|onerror|script|javascript/);
+  assert.match(sanitized, /https:\/\/dekt.bupt.edu.cn\/static\/x.png/);
+  assert.equal(__test.activityDetailHtml(null), "");
+  assert.equal(__test.activityDetailHtml("<p></p>"), "");
+  assert.equal(__test.activityDetailHtml("[]"), "");
+  assert.match(__test.activityDetailHtml(JSON.stringify([{ insert: { image: "12345/poster.png" } }])), /https:\/\/dekt.bupt.edu.cn\/api\/v1\/image\/12345\/poster.png/);
+  assert.throws(() => __test.activityDetailHtml("[invalid"));
+});
+
+test("one failed activity detail does not discard other activities or invent an AI summary", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url.pathname === "/api/v1/activity") return new Response(JSON.stringify({ data: activityFixture }));
+    if (url.pathname.endsWith("/101")) return new Response("unavailable", { status: 500 });
+    return new Response(JSON.stringify({ data: { detail: "<p>详情正文</p>" } }));
+  };
+  try {
+    const items = await __test.fetchActivityList("test-token");
+    assert.equal(items.length, 3);
+    assert.match(items[0].detailError, /刷新重试/);
+    assert.equal(items[1].summary, "详情正文");
+    assert.equal(items[1].detailError, undefined);
+  } finally { global.fetch = originalFetch; }
+});
+
+test("activity detail authentication and business errors are not treated as empty details", async () => {
+  const originalFetch = global.fetch;
+  try {
+    for (const response of [
+      () => new Response("expired", { headers: { "x-real-status": "401" } }),
+      () => new Response(JSON.stringify({ status: "error", data: { detail: "" } })),
+      () => new Response(JSON.stringify({ data: { id: 999, detail: "wrong activity" } })),
+    ]) {
+      global.fetch = async (url) => url.pathname === "/api/v1/activity"
+        ? new Response(JSON.stringify({ data: [activityFixture[0]] })) : response();
+      if (response().headers.get("x-real-status") === "401") {
+        await assert.rejects(__test.fetchActivityList("test-token"), /登录已失效/);
+      } else {
+        const [item] = await __test.fetchActivityList("test-token");
+        assert.ok(item.detailError);
+      }
+    }
+  } finally { global.fetch = originalFetch; }
+});
+
+test("activity feed distinguishes a genuine empty list from HTTP and schema failures", async () => {
+  const originalFetch = global.fetch;
+  const cases = [
+    [{ status: "ok", data: [], error: null }, {}, null],
+    [{ status: "error", data: [], error: "private upstream detail" }, {}, /查询失败/],
+    [{ success: false, data: [] }, {}, /查询失败/],
+    [{ code: 401, data: [] }, {}, /查询失败/],
+    [{ unexpected: [] }, {}, /格式已变化/],
+    [{ data: null }, {}, /格式已变化/],
+    [{ data: [null] }, {}, /格式已变化/],
+    [{ data: [{ id: 1 }] }, {}, /缺少活动编号、名称或时间/],
+    [{ data: [{ id: 1, name: "Missing time" }] }, {}, /缺少活动编号、名称或时间/],
+    [{ data: [] }, { headers: { "x-real-status": "401" } }, /登录已失效/],
+    [{ data: [] }, { headers: { "x-real-status": "403" } }, /登录已失效/],
+    [{ data: [] }, { headers: { "x-real-status": "500" } }, /HTTP 500/],
+    [{ data: [] }, { status: 503 }, /HTTP 503/],
+  ];
+  try {
+    for (const [payload, init, error] of cases) {
+      global.fetch = async () => new Response(JSON.stringify(payload), init);
+      if (error) await assert.rejects(__test.fetchActivityList("test-token"), error);
+      else assert.deepEqual(await __test.fetchActivityList("test-token"), []);
+    }
+    global.fetch = async () => new Response("<html>Login</html>");
+    await assert.rejects(__test.fetchActivityList("test-token"), /没有返回有效数据/);
+  } finally { global.fetch = originalFetch; }
+});
+
+test("activity mapping never fabricates the current time for missing or invalid upstream dates", () => {
+  assert.equal(__test.toActivityItem({ id: 1, name: "Untimed" }), null);
+  assert.equal(__test.toActivityItem({ id: 1, name: "Invalid", activity_start_time: "invalid" }), null);
+  const legacy = __test.toActivityItem({ id: 1, name: "Legacy", start_time: "2026-09-21T01:30:00Z", location: "Hall" });
+  assert.equal(legacy.eventTime, "2026-09-21T01:30:00Z");
+  assert.equal(legacy.campus, "Hall");
+});
+
+test("failed activity refresh retains the last genuine cache instead of reporting online-empty", async () => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "youxueban-activity-test-"));
+  const originalFetch = global.fetch;
+  const safeStorage = {
+    isEncryptionAvailable: () => true,
+    encryptString: (value) => Buffer.from(value),
+    decryptString: (value) => value.toString(),
+  };
+  const runtime = createLocalRuntime({
+    app: { getPath: () => temporaryRoot }, BrowserWindow: function () {}, safeStorage, session: {},
+  });
+  fs.writeFileSync(path.join(temporaryRoot, "local-settings.bin"), JSON.stringify({
+    campus: {
+      ssoAccount: "test", ssoPassword: "test", jwglAccount: "test", jwglPassword: "test",
+      portalCookies: [{ expires: -1 }],
+    },
+  }));
+  let activityPayload = { status: "ok", data: activityFixture, error: null };
+  global.fetch = async (address) => {
+    const url = new URL(address);
+    if (url.hostname === "my.bupt.edu.cn") throw new Error("Portal unavailable");
+    if (url.pathname === "/api/v1/auth/sessions") return new Response(JSON.stringify({ token: "test.session.token" }));
+    assert.equal(url.pathname, "/api/v1/activity");
+    return new Response(JSON.stringify(activityPayload));
+  };
+  try {
+    const online = (await runtime.request("/api/campus")).body;
+    assert.equal(online.statuses.find((status) => status.source === "activity").mode, "online");
+    assert.equal(online.items.length, 3);
+    activityPayload = { status: "error", data: [], error: "upstream-secret" };
+    const failed = (await runtime.request("/api/campus")).body;
+    assert.equal(failed.statuses.find((status) => status.source === "activity").mode, "cache");
+    assert.equal(failed.items.length, 3);
+    assert.ok(!JSON.stringify(failed).includes("upstream-secret"));
+    activityPayload = { status: "ok", data: [], error: null };
+    const empty = (await runtime.request("/api/campus")).body;
+    assert.equal(empty.statuses.find((status) => status.source === "activity").mode, "online");
+    assert.equal(empty.items.length, 0);
+  } finally {
+    global.fetch = originalFetch;
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("campus cookie header only sends cookies valid for the target URL", () => {
   const future = Date.now() / 1000 + 3600;
   const cookies = [

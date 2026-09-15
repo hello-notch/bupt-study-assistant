@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import DOMPurify from "dompurify";
 import "katex/dist/katex.min.css";
 import IconGlyph from "./components/IconGlyph.vue";
 import { renderAssistantContent } from "./assistant-markdown";
-import { courseTimes, normalizeImportedCourses, normalizeWeeks, parseCourseFile, type ImportedCourse } from "./course-import";
+import { courseTimes, isSameCourseSession, normalizeImportedCourses, normalizeWeeks, parseCourseFile, type ImportedCourse } from "./course-import";
 import { apiFetch } from "./auth";
 import { TEXTS } from "./texts";
 import type {
@@ -253,7 +254,6 @@ const courseAddOpen = ref(false);
 const courseEditing = ref(false);
 const courseForm = ref<Omit<Course, "id">>(blankCourse());
 const pendingCourseSlot = ref<{ weekday: number; startSection: number } | null>(null);
-const selectedCampusItem = ref<CampusItem | null>(null);
 const taskFilter = ref<"todo" | "all" | "done">("todo");
 const taskSearch = ref("");
 const campusTab = ref<"notice" | "activity">("notice");
@@ -263,8 +263,8 @@ const campusError = ref("");
 const campusUpdatedAt = ref("");
 const campusStatuses = ref<CampusSourceStatus[]>([]);
 const portalVisibleCount = ref(10);
-const campusSummaryBusy = ref(false);
-const campusSummaryError = ref("");
+const campusSummaryBusy = ref<Record<string, boolean>>({});
+const campusSummaryError = ref<Record<string, string>>({});
 const assistantInput = ref("");
 const assistantBusy = ref(false);
 const assistantToolStatus = ref("");
@@ -1304,6 +1304,19 @@ function openTaskModal(prefill = ""): void {
   taskModalOpen.value = true;
 }
 
+function formatCampusDate(value: string, withTime = false): string {
+  if (!value) return "日期未提供";
+  if (!withTime && /^\d{4}-\d{1,2}-\d{1,2}$/.test(value)) return value;
+  const absolute = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(value)
+    ? `${value.replace(" ", "T")}+08:00` : value;
+  const date = new Date(absolute);
+  if (!Number.isFinite(date.getTime())) return "日期未提供";
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    ...(withTime ? { hour: "2-digit", minute: "2-digit" } as const : {}),
+  }).format(date);
+}
+
 function openTaskEdit(task: StudyTask): void {
   clearTaskDeleteConfirmation();
   editingTaskId.value = task.id;
@@ -1633,10 +1646,7 @@ async function advanceImport(): Promise<void> {
   let nextId = Math.max(0, ...courses.value.map((course) => course.id)) + 1;
   const selectedCourses = selectedImportCourses.value;
   for (const imported of selectedCourses) {
-    const existing = courses.value.find((course) => course.name === imported.name
-      && course.weekday === imported.weekday
-      && course.startSection === imported.startSection
-      && course.endSection === imported.endSection);
+    const existing = courses.value.find((course) => isSameCourseSession(course, imported));
     if (existing) Object.assign(existing, imported);
     else courses.value.push({ ...imported, id: nextId++, reminderMinutes: preferences.value.courseReminder, color: colorForCourse(imported.name, courses.value) });
   }
@@ -1791,11 +1801,15 @@ function saveCourse(): void {
 }
 
 async function openCampusItem(item: CampusItem): Promise<void> {
+  campusTab.value = item.kind;
+  navigate("campus");
+}
+
+async function summarizeCampusItem(item: CampusItem): Promise<void> {
   item.read = true;
-  selectedCampusItem.value = item;
-  campusSummaryError.value = "";
-  if (item.kind !== "notice" || item.summary.trim()) return;
-  campusSummaryBusy.value = true;
+  if (item.kind !== "notice" || campusSummaryBusy.value[item.id]) return;
+  campusSummaryError.value[item.id] = "";
+  campusSummaryBusy.value[item.id] = true;
   try {
     const response = await apiFetch("/api/campus/summary", {
       method: "POST",
@@ -1805,10 +1819,12 @@ async function openCampusItem(item: CampusItem): Promise<void> {
     const payload = await response.json() as { summary?: string; error?: string };
     if (!response.ok || !payload.summary) throw new Error(payload.error || TEXTS.campus.summaryFailed);
     item.summary = payload.summary;
+    const current = campusItems.value.find((entry) => entry.kind === "notice" && entry.id === item.id && entry.url === item.url);
+    if (current) current.summary = payload.summary;
   } catch (error) {
-    campusSummaryError.value = error instanceof Error ? error.message : TEXTS.campus.summaryUnavailable;
+    campusSummaryError.value[item.id] = error instanceof Error ? error.message : TEXTS.campus.summaryUnavailable;
   } finally {
-    campusSummaryBusy.value = false;
+    campusSummaryBusy.value[item.id] = false;
   }
 }
 
@@ -1902,7 +1918,9 @@ async function loadCampusData(relogin = false): Promise<void> {
     const readableItems = payload.items.filter(isCampusItemReadable);
     campusItems.value = readableItems.map((item) => {
       const previous = localState.get(`${item.kind}:${item.id}`);
-      return { ...item, read: previous?.read ?? false };
+      const summary = item.kind === "notice" && !item.summary && previous?.url === item.url && previous.title === item.title
+        ? previous.summary : item.summary;
+      return { ...item, summary, read: previous?.read ?? false };
     });
     portalVisibleCount.value = 10;
     campusUpdatedAt.value = payload.updatedAt ?? new Date().toISOString();
@@ -2464,7 +2482,7 @@ function runAssistantAction(message: AssistantMessage): void {
             <div class="content-stack side-column">
               <article class="surface">
                 <div class="surface-heading"><h2>校园动态</h2><button class="text-button" type="button" @click="navigate('campus')">进入校园 <IconGlyph name="arrow-right" :size="15" /></button></div>
-                <button v-for="item in todayCampusItems" :key="item.id" class="news-row" type="button" @click="openCampusItem(item)"><span v-if="!item.read" class="unread-dot" /><strong>{{ item.title }}</strong><small>{{ item.source }} · {{ formatDateTime(item.publishedAt) }}</small></button>
+                <button v-for="item in todayCampusItems" :key="`${item.kind}:${item.id}`" class="news-row" type="button" @click="openCampusItem(item)"><span v-if="!item.read" class="unread-dot" /><strong :title="item.title">{{ item.title }}</strong><small>{{ item.source }} · {{ formatCampusDate(item.publishedAt, item.kind === 'activity') }}</small></button>
               </article>
               <article class="surface suggestion-card"><div class="surface-heading"><h2>现在做什么</h2><span>结合当前安排推荐</span></div><p>{{ currentSuggestion }}</p><button class="text-button" type="button" @click="nextSuggestion">换一个建议</button></article>
             </div>
@@ -2509,10 +2527,17 @@ function runAssistantAction(message: AssistantMessage): void {
           <div class="toolbar"><div class="segmented"><button type="button" :class="{ active: campusTab === 'notice' }" @click="campusTab = 'notice'">信息门户</button><button type="button" :class="{ active: campusTab === 'activity' }" @click="campusTab = 'activity'">第二课堂</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="campusSearch" placeholder="搜索标题、类别或内容" /></label></div>
           <p v-if="campusError" class="service-warning" role="status"><span>{{ campusError }}<template v-if="campusItems.length">已保留成功读取的数据</template></span><button v-if="campusNeedsRelogin" class="secondary-button" type="button" :disabled="campusBusy" @click="reloginCampus">重新登录（可能会短暂打开浏览器）</button></p>
           <div class="campus-grid">
-            <article v-for="item in filteredCampusItems" :key="item.id" class="campus-card surface" :class="{ unread: !item.read }">
-              <div class="campus-card-top"><span class="category-chip">{{ item.category }}</span></div>
-              <button class="campus-content" type="button" @click="openCampusItem(item)"><strong>{{ item.title }}</strong><p>{{ item.summary || (item.kind === 'notice' ? '点击生成 AI 通知总结' : '点击查看活动详情') }}</p><span v-if="item.campus"><IconGlyph name="map" :size="14" />{{ item.campus }}</span><span v-if="item.eventTime"><IconGlyph name="clock" :size="14" />{{ formatDateTime(item.eventTime) }}</span></button>
-              <footer><span>{{ item.source }}</span><time>{{ formatDateTime(item.publishedAt) }}</time></footer>
+            <article v-for="item in filteredCampusItems" :key="`${item.kind}:${item.id}`" class="campus-card surface" :class="{ unread: !item.read }">
+              <div class="campus-card-top"><span class="category-chip">{{ item.source }}</span><a v-if="item.kind === 'notice'" class="campus-original" :href="item.url" target="_blank" rel="noopener noreferrer" @click="item.read = true"><IconGlyph name="external" :size="14" />查看原文</a></div>
+              <div class="campus-content"><strong :title="item.title">{{ item.title }}</strong>
+                <template v-if="item.kind === 'notice'">
+                  <p v-if="item.summary" class="campus-summary">{{ item.summary }}</p>
+                  <div v-else-if="campusSummaryBusy[item.id]" class="summary-loading" role="status"><IconGlyph name="refresh" :size="14" />{{ TEXTS.campus.summaryLoading }}</div>
+                  <template v-else><p v-if="item.summary" class="campus-summary">{{ item.summary }}</p><p v-if="campusSummaryError[item.id]" class="form-error" role="alert">{{ campusSummaryError[item.id] }}</p><button class="campus-summary-button" type="button" @click="summarizeCampusItem(item)"><IconGlyph name="assistant" :size="14" />{{ item.summary ? '重新生成 AI 通知总结' : '点击生成 AI 通知总结' }}</button></template>
+                </template>
+                <template v-else><div v-if="item.detailHtml" class="activity-detail" v-html="DOMPurify.sanitize(item.detailHtml, { ADD_ATTR: ['target'] })" /><p v-else>{{ item.summary || (item.detailError ? '' : '暂无活动详情') }}</p><p v-if="item.detailError" class="form-error" role="status">{{ item.detailError }}</p></template>
+                <span v-if="item.campus"><IconGlyph name="map" :size="14" />{{ item.campus }}</span><span v-if="item.eventTime"><IconGlyph name="clock" :size="14" />{{ formatCampusDate(item.eventTime, true) }}<template v-if="item.eventEndTime"> - {{ formatCampusDate(item.eventEndTime, true) }}</template></span></div>
+              <footer><template v-if="item.kind === 'activity'"><span class="activity-statuses"><b v-for="status in (item.activityStatus ?? ['状态未读取'])" :key="status" :class="{ full: status === '人数已满' }">{{ status }}</b></span><time v-if="item.activityStatus?.includes('需报名')" class="activity-registration">报名：{{ item.registrationStartTime ? formatCampusDate(item.registrationStartTime, true) : '开始时间未提供' }} 至 {{ item.registrationEndTime ? formatCampusDate(item.registrationEndTime, true) : '结束时间未提供' }}</time></template><template v-else><span>{{ item.source }}</span><time>{{ formatCampusDate(item.publishedAt) }}</time></template></footer>
             </article>
           </div>
           <div v-if="campusBusy && !campusItems.length" class="empty-state surface"><IconGlyph name="refresh" :size="28" /><strong>正在读取官方服务</strong><span>信息门户与第二课堂会分别返回状态</span></div>
@@ -2609,7 +2634,7 @@ function runAssistantAction(message: AssistantMessage): void {
           <label v-if="importMode === 'file'" class="file-drop"><IconGlyph name="upload" :size="26" /><strong>{{ importFile?.name || '选择课表文件' }}</strong><span>{{ importPreview.length ? `已识别 ${importPreview.length} 门课程` : '文件只在本机解析，不会上传到第三方' }}</span><input type="file" accept=".xls,.xlsx,.csv" @change="selectImportFile" /></label>
           <p v-if="importError" class="form-error" role="alert">{{ importError }}</p>
         </div>
-        <div v-else-if="importStep === 2" class="import-preview"><div class="preview-stat"><strong>{{ importPreview.length }}</strong><span>识别课程</span></div><div class="preview-stat"><strong>{{ selectedImportCourses.length }}</strong><span>已勾选</span></div><div class="preview-stat warning"><strong>{{ selectedImportCourses.filter(item => courses.some(course => course.name === item.name && course.weekday === item.weekday && course.startSection === item.startSection)).length }}</strong><span>将更新</span></div><div class="import-course-list"><label v-for="(item, index) in importPreview" :key="`${item.name}-${item.weekday}-${item.startSection}-${index}`" class="import-course-item"><span><b>{{ item.name }}</b>{{ weekdays[item.weekday - 1] ?? `周${item.weekday}` }} 第 {{ item.startSection }}–{{ item.endSection }} 节</span><input v-model="importSelections[index]" type="checkbox" :aria-label="`选择导入${item.name}`" /></label></div></div>
+        <div v-else-if="importStep === 2" class="import-preview"><div class="preview-stat"><strong>{{ importPreview.length }}</strong><span>识别课程</span></div><div class="preview-stat"><strong>{{ selectedImportCourses.length }}</strong><span>已勾选</span></div><div class="preview-stat warning"><strong>{{ selectedImportCourses.filter(item => courses.some(course => isSameCourseSession(course, item))).length }}</strong><span>将更新</span></div><div class="import-course-list"><label v-for="(item, index) in importPreview" :key="`${item.name}-${item.weekday}-${item.startSection}-${index}`" class="import-course-item"><span><b>{{ item.name }}</b>{{ weekdays[item.weekday - 1] ?? `周${item.weekday}` }} 第 {{ item.startSection }}–{{ item.endSection }} 节<br>{{ item.weeks }} 周 · {{ item.teacher }}<br>{{ item.location }}</span><input v-model="importSelections[index]" type="checkbox" :aria-label="`选择导入${item.name} ${item.weeks}周 ${item.teacher}`" /></label></div></div>
         <div v-else class="import-finish"><span class="success-icon"><IconGlyph name="check" :size="28" /></span><h3>预览完成</h3><template v-if="courses.length"><p>当前已有 {{ courses.length }} 门课程请选择新课表的处理方式：</p><div class="import-strategy" role="radiogroup" aria-label="新课表处理方式"><label :class="{ active: importStrategy === 'replace' }"><input v-model="importStrategy" type="radio" value="replace" /><span><strong>替换原课表</strong><small>清空现有课程后写入新课表</small></span></label><label :class="{ active: importStrategy === 'merge' }"><input v-model="importStrategy" type="radio" value="merge" /><span><strong>合并课表</strong><small>保留原课程并更新重复课程</small></span></label></div></template><p v-if="selectedImportCourses.length">确认后会把已勾选的 {{ selectedImportCourses.length }} 门课程写入你的课表</p><p v-else>请至少勾选一门课程后再确认导入</p></div>
         <footer><button class="secondary-button" type="button" :disabled="importBusy" @click="importStep === 1 ? courseImportOpen = false : importStep--">{{ importStep === 1 ? '取消' : '上一步' }}</button><button class="primary-button" type="button" :disabled="importBusy || (importStep === 3 && !selectedImportCourses.length)" @click="advanceImport">{{ importBusy ? '正在读取…' : importStep === 3 ? `确认导入 ${selectedImportCourses.length} 门` : '下一步' }}</button></footer>
       </section>
@@ -2623,7 +2648,6 @@ function runAssistantAction(message: AssistantMessage): void {
       </aside>
     </div>
 
-        <div v-if="selectedCampusItem" class="modal-backdrop" @click.self="selectedCampusItem = null"><section class="modal campus-detail" role="dialog" aria-modal="true" aria-label="校园信息详情"><header><span class="category-chip">{{ selectedCampusItem.category }}</span><button class="icon-button" type="button" aria-label="关闭" @click="selectedCampusItem = null"><IconGlyph name="close" /></button></header><h2>{{ selectedCampusItem.title }}</h2><div v-if="campusSummaryBusy" class="summary-loading"><IconGlyph name="assistant" /><span>{{ TEXTS.campus.summaryLoading }}</span></div><p v-else-if="selectedCampusItem.summary">{{ selectedCampusItem.summary }}</p><p v-else-if="campusSummaryError" class="form-error" role="alert">{{ campusSummaryError }}</p><p v-else>{{ TEXTS.campus.summaryUnavailable }}</p><dl><div><dt>来源</dt><dd>{{ selectedCampusItem.source }}</dd></div><div><dt>发布时间</dt><dd>{{ formatDateTime(selectedCampusItem.publishedAt) }}</dd></div><div v-if="selectedCampusItem.eventTime"><dt>活动时间</dt><dd>{{ formatDateTime(selectedCampusItem.eventTime) }}</dd></div></dl><footer><a class="primary-button" :href="selectedCampusItem.url" target="_blank" rel="noopener noreferrer"><IconGlyph name="external" />查看原文</a></footer></section></div>
 
     <div v-if="accountBindingOpen" class="modal-backdrop" @click.self="!accountBindingBusy && (accountBindingOpen = false)">
       <section class="modal credential-modal" role="dialog" aria-modal="true" aria-labelledby="credential-modal-title">

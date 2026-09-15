@@ -52,6 +52,16 @@ export function normalizeImportedCourses(rows: Array<Partial<ImportedCourse>>): 
   return rows.map((row, index) => normalizeCourse(row, index));
 }
 
+export function isSameCourseSession(left: ImportedCourse, right: ImportedCourse): boolean {
+  return left.name === right.name
+    && left.weekday === right.weekday
+    && left.startSection === right.startSection
+    && left.endSection === right.endSection
+    && normalizeWeeks(left.weeks) === normalizeWeeks(right.weeks)
+    && left.teacher === right.teacher
+    && left.location === right.location;
+}
+
 /** Remove common HTML entities that occasionally appear in exported course names. */
 export function cleanImportedCourseName(value: string): string {
   return value
@@ -117,7 +127,7 @@ function parseBuptMatrix(matrix: unknown[][]): ImportedCourse[] {
 
   const result: ImportedCourse[] = [];
   const seen = new Set<string>();
-  const pattern = /([^\n]+)\n([^\n]+)\n(\d+(?:[-~～,，]\d+)*)\[周\]\n([^\n]*)\n\[(\d+(?:-\d+)*)\]节/g;
+  const pattern = /(?:^|\n)([^\n]+(?:\n(?!\d+(?:[-~～,，]\d+)*\[周\])[^\n]+)*?)\n([^\n]+)\n(\d+(?:[-~～,，]\d+)*)\[周\]\n([^\n]*)\n\[(\d+(?:-\d+)*)\]节/g;
   for (const row of matrix.slice(headerIndex + 1)) {
     weekdayColumns.forEach((weekday, column) => {
       const text = String(row[column] ?? "").replace(/\r\n?/g, "\n").trim();
