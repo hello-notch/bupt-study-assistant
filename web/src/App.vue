@@ -147,12 +147,10 @@ const navItems: Array<{ id: PageId; label: string; icon: string }> = [
   { id: "electricity", label: "查电费", icon: "electricity" },
   { id: "assistant", label: "助手", icon: "assistant" },
 ];
-const mobilePrimaryNavItems = navItems.filter((item) => ["today", "tasks", "courses", "assistant"].includes(item.id));
-const mobileMoreNavItems: Array<{ id: PageId; label: string; icon: string; description: string }> = [
-  { id: "campus", label: "校园服务", icon: "campus", description: "通知与第二课堂" },
-  { id: "electricity", label: "宿舍电费", icon: "electricity", description: "查询余额与提醒" },
-  { id: "notifications", label: "消息中心", icon: "bell", description: "课程、任务与校园动态" },
-  { id: "settings", label: "偏好设置", icon: "settings", description: "外观、提醒与隐私" },
+const mobileNavItems: typeof navItems = [
+  ...navItems,
+  { id: "notifications", label: "消息", icon: "bell" },
+  { id: "settings", label: "设置", icon: "settings" },
 ];
 
 const defaultPreferences: Preferences = {
@@ -195,7 +193,7 @@ const saved = (() => {
 const initialPageHash = location.hash.replace("#/", "") as PageId;
 const initialPage = [...navItems.map((item) => item.id), "notifications", "settings"].includes(initialPageHash) ? initialPageHash : "today";
 const currentPage = ref<PageId>(initialPage);
-const mobileMoreOpen = ref(false);
+let pageSwipe: { x: number; y: number; startedAt: number; page: PageId } | null = null;
 const sidebarRef = ref<HTMLElement | null>(null);
 const sidebarGlider = ref({ top: 0, height: 46, visible: false });
 const sidebarGliderReady = ref(false);
@@ -248,6 +246,13 @@ const importPreview = ref<ImportedCourse[]>([]);
 const importSelections = ref<boolean[]>([]);
 const importError = ref("");
 const importBusy = ref(false);
+let importController: AbortController | null = null;
+function cancelImport(): void {
+  importController?.abort();
+  importController = null;
+  importBusy.value = false;
+  courseImportOpen.value = false;
+}
 const importStrategy = ref<ImportStrategy>("replace");
 const selectedCourse = ref<Course | null>(null);
 const courseAddOpen = ref(false);
@@ -783,7 +788,6 @@ function navigate(page: PageId): void {
   clearTaskDeleteConfirmation();
   window.scrollTo({ top: 0, behavior: "auto" });
   currentPage.value = page;
-  mobileMoreOpen.value = false;
   location.hash = `/${page}`;
   if (page === "assistant" && !localSettings.value.ai.configured) openAiConfig();
   void nextTick(() => window.scrollTo({ top: 0, behavior: "auto" }));
@@ -870,6 +874,39 @@ async function completeWelcome(): Promise<void> {
   showToast(TEXTS.welcome.greeting(profileName.value));
   if (!localSettings.value.campus.configured) openAccountBinding();
   else if (!campusItems.value.length) await loadCampusData();
+}
+
+function startPageSwipe(event: TouchEvent): void {
+  pageSwipe = null;
+  if (!window.matchMedia("(max-width: 720px)").matches || event.touches.length !== 1
+    || document.querySelector('[aria-modal="true"]')) return;
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || target.closest("input, textarea, select, button, a, [contenteditable]")) return;
+  // Let nested horizontal scrollers retain their own gestures.
+  for (let element: HTMLElement | null = target; element && element !== event.currentTarget; element = element.parentElement) {
+    if (element.scrollWidth > element.clientWidth + 1 && /auto|scroll/.test(getComputedStyle(element).overflowX)) return;
+  }
+  const touch = event.touches[0]!;
+  pageSwipe = { x: touch.clientX, y: touch.clientY, startedAt: performance.now(), page: currentPage.value };
+}
+
+function movePageSwipe(event: TouchEvent): void {
+  if (!pageSwipe) return;
+  const touch = event.touches[0];
+  if (event.touches.length !== 1 || !touch || Math.abs(touch.clientY - pageSwipe.y) > 36) pageSwipe = null;
+}
+
+function endPageSwipe(event: TouchEvent): void {
+  const swipe = pageSwipe;
+  pageSwipe = null;
+  const touch = event.changedTouches[0];
+  if (!swipe || !touch || swipe.page !== currentPage.value || performance.now() - swipe.startedAt > 800) return;
+  const dx = touch.clientX - swipe.x;
+  const dy = touch.clientY - swipe.y;
+  if (Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy) * 2) return;
+  const index = mobileNavItems.findIndex((item) => item.id === currentPage.value);
+  const next = mobileNavItems[index + (dx < 0 ? 1 : -1)];
+  if (next) navigate(next.id);
 }
 
 async function refreshLocalSettings(): Promise<void> {
@@ -1455,12 +1492,12 @@ function playReminderSound(): void {
 async function handleBrowserNotificationsChange(): Promise<void> {
   if (!preferences.value.browserNotifications) return;
   if (window.youxuebanRuntime?.notify) {
-    showToast("Windows通知已开启");
+    showToast("系统通知提醒已开启");
     return;
   }
   if (typeof Notification === "undefined") {
     preferences.value.browserNotifications = false;
-    showToast("当前运行环境不支持 Windows 通知");
+    showToast("当前运行环境不支持系统通知");
     return;
   }
   try {
@@ -1470,7 +1507,7 @@ async function handleBrowserNotificationsChange(): Promise<void> {
       showToast("未获得系统通知权限，仍会保留页面内提醒和声音");
       return;
     }
-    showToast("Windows 通知已开启");
+    showToast("系统通知已开启");
   } catch {
     preferences.value.browserNotifications = false;
     showToast("无法开启系统通知，仍会保留页面内提醒和声音");
@@ -1535,6 +1572,7 @@ function courseGridPosition(course: Course): { gridColumn: string; gridRow: stri
 }
 
 function openImport(): void {
+  cancelImport();
   importStep.value = 1;
   importFile.value = null;
   importPreview.value = [];
@@ -1586,17 +1624,26 @@ async function loadImportPreview(): Promise<boolean> {
       return false;
     }
     importBusy.value = true;
+    const controller = new AbortController();
+    importController = controller;
+    const timeout = setTimeout(() => controller.abort(new Error("课表读取超时，请重试")), 70_000);
     try {
-      const response = await apiFetch("/api/courses/mine", { method: "POST", body: "{}" });
+      const response = await apiFetch("/api/courses/mine", { method: "POST", body: "{}", signal: controller.signal });
       const payload = await response.json() as { courses?: Array<Partial<ImportedCourse>>; error?: string };
+      if (controller.signal.aborted || importController !== controller) return false;
       if (!response.ok || !payload.courses) throw new Error(payload.error || TEXTS.auth.coursesQueryFailed);
       setImportPreview(normalizeImportedCourses(payload.courses));
       return true;
     } catch (error) {
+      if (importController !== controller) return false;
       importError.value = error instanceof Error ? error.message : TEXTS.auth.coursesQueryFailed;
       return false;
     } finally {
-      importBusy.value = false;
+      clearTimeout(timeout);
+      if (importController === controller) {
+        importBusy.value = false;
+        importController = null;
+      }
     }
   }
   return false;
@@ -2447,7 +2494,7 @@ function runAssistantAction(message: AssistantMessage): void {
     </aside>
 
     <div class="app-main">
-      <main class="page-container">
+      <main class="page-container" @touchstart.passive="startPageSwipe" @touchmove.passive="movePageSwipe" @touchend.passive="endPageSwipe" @touchcancel="pageSwipe = null">
         <Transition name="page-view" mode="out-in" appear>
         <section v-if="currentPage === 'today'" class="page page-today">
           <header class="page-heading today-heading"><div><span class="eyebrow">BUPT · 第 {{ currentAcademicWeek }} 周</span><h1>{{ greeting }}，{{ profileName || '同学' }}</h1><p>{{ TEXTS.pages.todayDescription }}</p></div><time class="today-clock"><strong>{{ timeHeading }}</strong><span>{{ dateHeading }}</span></time></header>
@@ -2517,7 +2564,7 @@ function runAssistantAction(message: AssistantMessage): void {
               <button v-for="course in visibleCourses" :key="course.id" class="course-cell" :class="[`course-${course.color}`, { compact: course.endSection === course.startSection }]" :style="courseGridPosition(course)" type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><span>{{ course.location }}</span><small>{{ course.teacher }}</small></button>
             </div>
           </div>
-          <div class="mobile-course-list surface"><article v-for="course in visibleCourses" :key="course.id"><time>{{ weekdays[course.weekday - 1] ?? `周${course.weekday}` }}<br>{{ formatWeekDate(weekDates[course.weekday - 1]!.date) }} · {{ course.startTime }}–{{ course.endTime }}</time><span :class="`course-marker course-${course.color}`" /><button type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><small>第 {{ course.startSection }}–{{ course.endSection }} 节 · {{ course.location }} · {{ course.teacher }}</small></button></article><div v-if="!visibleCourses.length" class="empty-state compact"><strong>这一周没有课程</strong><span>仍可使用上方按钮继续切换周次，或导入你的真实课表</span></div></div>
+          <div v-if="!visibleCourses.length" class="empty-state compact"><strong>这一周没有课程</strong><span>仍可使用上方按钮继续切换周次，或导入你的真实课表</span></div>
         </section>
 
         <section v-else-if="currentPage === 'campus'" class="page">
@@ -2594,7 +2641,7 @@ function runAssistantAction(message: AssistantMessage): void {
           <article class="settings-section surface profile-settings"><div><h2>个人资料</h2><p>昵称会用于问候；头像可从本地上传，图片只保存在当前设备</p></div><div class="profile-editor"><span class="avatar avatar-preview"><img v-if="profileDraftAvatar" :src="profileDraftAvatar" alt="头像预览" /><template v-else>{{ profileDraftName.trim().slice(0, 1) || '邮' }}</template></span><div class="profile-fields"><label>昵称<input v-model="profileDraftName" maxlength="20" placeholder="该怎么称呼你" @input="profileEditError = ''" /></label><div class="avatar-upload-actions"><label class="secondary-button file-button"><IconGlyph name="upload" :size="16" />上传头像<input type="file" accept="image/png,image/jpeg,image/webp" @change="selectAvatarFile" /></label><button v-if="profileDraftAvatar" class="text-button" type="button" @click="clearAvatarDraft">移除头像</button><small>PNG、JPG 或 WebP，不超过 2 MB</small></div><p v-if="profileEditError" class="inline-error" role="alert">{{ profileEditError }}</p></div><button class="secondary-button" type="button" @click="saveProfile">保存资料</button></div></article>
           <article class="settings-section surface appearance-settings"><div><h2>外观与动效</h2><p>选择显示模式，并按需要降低界面动态效果</p></div><div class="appearance-controls"><div class="segmented"><button v-for="option in [{id:'system',label:'跟随系统'},{id:'light',label:'浅色'},{id:'dark',label:'深色'}]" :key="option.id" type="button" :class="{ active: preferences.theme === option.id }" @click="preferences.theme = option.id as Preferences['theme']">{{ option.label }}</button></div><label class="switch-row motion-setting"><span><strong>减少动画效果</strong><small>关闭菜单滑动和页面淡入淡出，适合对动态效果敏感时使用</small></span><input v-model="preferences.reduceMotion" type="checkbox" role="switch" aria-label="减少动画效果" /></label></div></article>
           <article class="settings-section surface"><div><h2>默认提醒</h2><p>{{ TEXTS.pages.reminderDescription }}</p></div><label>任务提前<div class="reminder-control"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="defaultTaskReminderValue" @input="updateDefaultTaskReminderInput" @blur="restoreDefaultTaskReminderInput" /><select :value="defaultTaskReminderUnit" aria-label="任务提醒单位" @change="changeDefaultTaskReminderUnit"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="courseReminderValue" @input="updateCourseReminderInput" @blur="restoreCourseReminderInput" /><span>分钟</span></div></label></article>
-          <article class="settings-section surface notification-settings"><div><h2>通知设置</h2><p>声音和 Windows通知可以分别控制</p></div><div class="notification-controls"><label class="switch-row"><span><strong>播放声音</strong><small>提醒触发时播放提示音</small></span><input v-model="preferences.soundNotifications" type="checkbox" role="switch" aria-label="播放声音" /></label><label class="switch-row"><span><strong>Windows通知</strong><small>在应用运行时显示系统通知</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="Windows通知" @change="handleBrowserNotificationsChange" /></label></div></article>
+          <article class="settings-section surface notification-settings"><div><h2>通知设置</h2><p>声音和系统通知可以分别控制</p></div><div class="notification-controls"><label class="switch-row"><span><strong>播放声音</strong><small>提醒触发时播放提示音</small></span><input v-model="preferences.soundNotifications" type="checkbox" role="switch" aria-label="播放声音" /></label><label class="switch-row"><span><strong>系统通知</strong><small>在应用运行时显示系统通知，需允许本机通知权限</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="系统通知" @change="handleBrowserNotificationsChange" /></label></div></article>
           <article class="settings-section surface"><div><h2>学期课表</h2><p>第 1 周起始日，用于计算周次；周课表仍按周一至周日排列</p></div><label>第一周开始<input v-model="preferences.semesterStart" type="date" /></label></article>
           <article class="settings-section surface"><div><h2>静默时段</h2><p>{{ TEXTS.pages.quietHoursDescription }}</p></div><label>开始<input v-model="preferences.quietStart" type="time" /></label><label>结束<input v-model="preferences.quietEnd" type="time" /></label></article>
           <article class="settings-section surface privacy-settings"><div><h2>隐私</h2><p>控制助手如何使用你的数据</p></div><div class="switch-row"><span><strong>个性化记忆</strong><small>允许助手参考当前对话的历史消息与称呼</small></span><input v-model="preferences.memoryEnabled" type="checkbox" role="switch" aria-label="个性化记忆" /></div><div class="switch-row"><span><strong>学习数据分析</strong><small>允许助手分析本地课程、任务与学习节奏</small></span><input v-model="preferences.analyticsEnabled" type="checkbox" role="switch" aria-label="学习数据分析" /></div></article>
@@ -2605,16 +2652,7 @@ function runAssistantAction(message: AssistantMessage): void {
       </main>
     </div>
 
-    <nav class="mobile-nav" aria-label="移动端主导航"><button v-for="item in mobilePrimaryNavItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" @click="navigate(item.id)"><IconGlyph :name="item.icon" /><span>{{ item.label }}</span></button><button type="button" :class="{ active: mobileMoreOpen || mobileMoreNavItems.some((item) => item.id === currentPage) }" aria-haspopup="dialog" :aria-expanded="mobileMoreOpen" @click="mobileMoreOpen = !mobileMoreOpen"><IconGlyph name="more" /><span>更多</span></button></nav>
-
-    <Transition name="mobile-menu">
-      <div v-if="mobileMoreOpen" class="mobile-more-backdrop" @click.self="mobileMoreOpen = false">
-        <section class="mobile-more-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-more-title">
-          <header><div><span class="eyebrow">邮学伴</span><h2 id="mobile-more-title">更多校园服务</h2></div><button class="icon-button" type="button" aria-label="关闭更多服务" @click="mobileMoreOpen = false"><IconGlyph name="close" /></button></header>
-          <div class="mobile-more-grid"><button v-for="item in mobileMoreNavItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" @click="navigate(item.id)"><span class="mobile-more-icon"><IconGlyph :name="item.icon" /></span><span><strong>{{ item.label }}</strong><small>{{ item.description }}</small></span><IconGlyph name="chevron-right" :size="16" /></button></div>
-        </section>
-      </div>
-    </Transition>
+    <nav class="mobile-nav" aria-label="移动端主导航"><button v-for="item in mobileNavItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" :aria-current="currentPage === item.id ? 'page' : undefined" :title="item.label" @click="navigate(item.id)"><IconGlyph :name="item.icon" :size="18" /><span>{{ item.label }}</span></button></nav>
 
     <div v-if="taskModalOpen" class="modal-backdrop" @click.self="taskModalOpen = false">
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header><div><span class="eyebrow">{{ editingTaskId === null ? '新建' : '编辑' }}</span><h2 id="task-modal-title">{{ editingTaskId === null ? '添加任务' : '编辑任务' }}</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="taskModalOpen = false"><IconGlyph name="close" /></button></header><form @submit.prevent="createTask"><label>任务内容<input v-model="taskForm.title" autofocus placeholder="例如：完成软件工程需求分析" /></label><div class="form-grid"><label>课程或分类<input v-model="taskForm.course" placeholder="个人计划" /></label><label>截止时间<input v-model="taskForm.dueAt" type="datetime-local" /></label></div><label>提前提醒（分钟）<input v-model.number="taskForm.reminderMinutes" type="number" min="0" max="10080" step="1" placeholder="0 表示到点提醒" /></label><label class="switch-row modal-switch"><span><strong>静默时段仍提醒</strong><small>仅为确实不能错过的任务开启</small></span><input v-model="taskForm.remindDuringQuiet" type="checkbox" role="switch" /></label><footer><button class="secondary-button" type="button" @click="taskModalOpen = false">取消</button><button class="primary-button" type="submit">{{ editingTaskId === null ? '添加任务' : '保存修改' }}</button></footer></form></section>
@@ -2624,9 +2662,9 @@ function runAssistantAction(message: AssistantMessage): void {
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="course-add-modal-title"><header><div><span class="eyebrow">新建课程</span><h2 id="course-add-modal-title">添加课程</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="courseAddOpen = false"><IconGlyph name="close" /></button></header><form class="course-edit-form" @submit.prevent="createCourse"><label>课程名<input v-model="courseForm.name" autofocus placeholder="例如：高等数学" /></label><div class="form-grid"><label>教师<input v-model="courseForm.teacher" placeholder="未填写" /></label><label>地点<input v-model="courseForm.location" placeholder="待定" /></label></div><div class="form-grid"><label>星期<select v-model.number="courseForm.weekday"><option v-for="(day,index) in weekdayOptions" :key="day" :value="index + 1">周{{ day }}</option></select></label><label>周次<input v-model="courseForm.weeks" placeholder="1-2，4-10" inputmode="numeric" /></label></div><div class="form-grid"><label>开始节次<input v-model.number="courseForm.startSection" type="number" min="1" max="20" /></label><label>结束节次<input v-model.number="courseForm.endSection" type="number" min="1" max="20" /></label></div><label>提前提醒（分钟）<input v-model.number="courseForm.reminderMinutes" type="number" min="0" max="10080" step="1" /></label><footer><button class="secondary-button" type="button" @click="courseAddOpen = false">取消</button><button class="primary-button" type="submit">添加课程</button></footer></form></section>
     </div>
 
-    <div v-if="courseImportOpen" class="modal-backdrop" @click.self="courseImportOpen = false">
+    <div v-if="courseImportOpen" class="modal-backdrop" @click.self="cancelImport">
       <section class="modal import-modal" role="dialog" aria-modal="true" aria-labelledby="import-modal-title">
-        <header><div><span class="eyebrow">步骤 {{ importStep }} / 3</span><h2 id="import-modal-title">导入课表</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="courseImportOpen = false"><IconGlyph name="close" /></button></header>
+        <header><div><span class="eyebrow">步骤 {{ importStep }} / 3</span><h2 id="import-modal-title">导入课表</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="cancelImport"><IconGlyph name="close" /></button></header>
         <div class="step-indicator"><span v-for="step in 3" :key="step" :class="{ active: step <= importStep }" /></div>
         <div v-if="importStep === 1" class="import-body">
           <div class="import-options"><button type="button" :class="{ active: importMode === 'mine' }" @click="importMode = 'mine'; importError = ''"><IconGlyph name="courses" :size="24" /><strong>一键导入我的课表</strong><span>登录教务系统并读取当前学生课表</span></button><button type="button" :class="{ active: importMode === 'file' }" @click="importMode = 'file'; importError = ''"><IconGlyph name="upload" :size="24" /><strong>上传课表文件</strong><span>在本机解析 XLS/XLSX/CSV</span></button></div>
@@ -2636,7 +2674,7 @@ function runAssistantAction(message: AssistantMessage): void {
         </div>
         <div v-else-if="importStep === 2" class="import-preview"><div class="preview-stat"><strong>{{ importPreview.length }}</strong><span>识别课程</span></div><div class="preview-stat"><strong>{{ selectedImportCourses.length }}</strong><span>已勾选</span></div><div class="preview-stat warning"><strong>{{ selectedImportCourses.filter(item => courses.some(course => isSameCourseSession(course, item))).length }}</strong><span>将更新</span></div><div class="import-course-list"><label v-for="(item, index) in importPreview" :key="`${item.name}-${item.weekday}-${item.startSection}-${index}`" class="import-course-item"><span><b>{{ item.name }}</b>{{ weekdays[item.weekday - 1] ?? `周${item.weekday}` }} 第 {{ item.startSection }}–{{ item.endSection }} 节<br>{{ item.weeks }} 周 · {{ item.teacher }}<br>{{ item.location }}</span><input v-model="importSelections[index]" type="checkbox" :aria-label="`选择导入${item.name} ${item.weeks}周 ${item.teacher}`" /></label></div></div>
         <div v-else class="import-finish"><span class="success-icon"><IconGlyph name="check" :size="28" /></span><h3>预览完成</h3><template v-if="courses.length"><p>当前已有 {{ courses.length }} 门课程请选择新课表的处理方式：</p><div class="import-strategy" role="radiogroup" aria-label="新课表处理方式"><label :class="{ active: importStrategy === 'replace' }"><input v-model="importStrategy" type="radio" value="replace" /><span><strong>替换原课表</strong><small>清空现有课程后写入新课表</small></span></label><label :class="{ active: importStrategy === 'merge' }"><input v-model="importStrategy" type="radio" value="merge" /><span><strong>合并课表</strong><small>保留原课程并更新重复课程</small></span></label></div></template><p v-if="selectedImportCourses.length">确认后会把已勾选的 {{ selectedImportCourses.length }} 门课程写入你的课表</p><p v-else>请至少勾选一门课程后再确认导入</p></div>
-        <footer><button class="secondary-button" type="button" :disabled="importBusy" @click="importStep === 1 ? courseImportOpen = false : importStep--">{{ importStep === 1 ? '取消' : '上一步' }}</button><button class="primary-button" type="button" :disabled="importBusy || (importStep === 3 && !selectedImportCourses.length)" @click="advanceImport">{{ importBusy ? '正在读取…' : importStep === 3 ? `确认导入 ${selectedImportCourses.length} 门` : '下一步' }}</button></footer>
+        <footer><button class="secondary-button" type="button" @click="importBusy || importStep === 1 ? cancelImport() : importStep--">{{ importBusy || importStep === 1 ? '取消' : '上一步' }}</button><button class="primary-button" type="button" :disabled="importBusy || (importStep === 3 && !selectedImportCourses.length)" @click="advanceImport">{{ importBusy ? '正在读取…' : importStep === 3 ? `确认导入 ${selectedImportCourses.length} 门` : '下一步' }}</button></footer>
       </section>
     </div>
 

@@ -1,6 +1,6 @@
 # 邮学伴
 
-邮学伴是面向北邮学生的本地优先学习与校园信息助手。Windows EXE 加载安装包内的 Vue 页面，不需要部署或启动邮学伴服务端，也没有邮学伴账密登录。
+邮学伴是面向北邮学生的本地优先学习与校园信息助手，现提供 Windows 客户端与 Android 测试版。两端加载安装包内的共享 Vue 页面，不需要部署或启动邮学伴服务端，也没有邮学伴账密登录。
 
 ## 当前功能
 
@@ -22,6 +22,7 @@ bupt_study_assistant/
 ├─ client/                      Electron 桌面壳与设备内运行时
 │  ├─ local-runtime.cjs         校园、课表、电费和模型直连逻辑
 │  └─ main.cjs / preload.cjs    安全 IPC 边界
+├─ android/                     Android 原生壳、安全桥接与校园认证适配
 ├─ docs/                        当前架构和发布文档
 ├─ scripts/                     桌面启动、课表回归测试与图标工具
 └─ run-client.cmd               构建源码并直接打开桌面应用
@@ -68,6 +69,20 @@ pnpm run dist:win
 
 
 ## 验证
+
+### Android 测试版
+
+Android 版提供本机任务、课程、文件课表导入、校园信息、电费和学习助手，并针对手机调整导航、课表和触摸交互。敏感配置使用 Android Keystore 保护，校园认证使用独立 WebView；生成的网页资源、SDK、本机配置与签名密钥不提交仓库。
+
+准备 Android SDK 35、build-tools 35.0.0、JDK 17 或 21 和兼容的 Gradle 后：
+
+```powershell
+pwsh -NoProfile -File .\scripts\build-android.ps1 -SdkRoot "<Android-SDK>" -JavaHome "<JDK>" -Gradle "<gradle.bat>"
+```
+
+输出为 `android/app/build/outputs/apk/debug/YouXueBan-1.1.0-Android-test.apk`，属于 Debug 测试包，并非正式签名发布包。构建会重新生成共享网页及 Android 运行时资源。连接已授权的手机后可通过 `adb install -r` 覆盖安装；开发与验收要求见 `AGENTS.md` 第 12 节。
+
+### 自动化验证
 
 运行 `pnpm --dir client test` 验证本地运行时和两种课表导入的分周保留规则。
 

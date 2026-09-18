@@ -4,7 +4,7 @@
 
 ## 桌面模式更新（优先于下方历史说明）
 
-- 仅支持 Electron 桌面应用；`web/` 保留为桌面 UI 源码。
+- 支持 Electron Windows 客户端和 Android 客户端；`web/` 为两端共享 UI 源码。Android 开发与真机验收遵循第 12 节，该节优先于下方仅适用于桌面的历史说明。
 - 已移除 `run-web.cmd`、`run-web.ps1`、`web/dev-api.ts`、`.env.example` 和 `config/ai_routes.toml`。下方涉及浏览器适配器的说明不再适用。
 - 首次执行 `pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir client install --frozen-lockfile`。
 - 根目录 `run-client.cmd` 调用 `scripts/start-client.cjs`，先类型检查和构建，再打开 Electron。没有网页服务器，不生成发布包；用户要求验收时保留桌面窗口。
@@ -233,3 +233,91 @@ node --test .\local-runtime.test.cjs
 8. **验证假阳性**：类型检查和构建通过不代表交互正确。课表对齐、圆球移动与换色、空课表换周、删除二次确认、多会话刷新保留、思考切换、图片预览和 390px 无溢出都应通过真实页面证据验证。
 
 最近一次完整回归基线：前端两项 TypeScript 检查与 Vite 构建通过，Electron 本地运行时测试通过；桌面端和 390px 视口无横向溢出、控制台无错误。后续测试数量变化时以当前测试集为准，不要把数字写进产品界面。
+
+## 12. Android 移植与 ADB 真机调试规范
+
+Android 端不是把 `web/dist` 直接放进 APK 就完成了。Windows 版依赖 Electron IPC、本机文件存储、Electron Cookie 会话、隐藏 BrowserWindow 和 Playwright；Android 必须为这些能力提供原生桥接或等价实现。网页、Android 原生壳和共享本地运行时之间的接口应保持 API 形状一致，避免为两个平台维护两套业务规则。
+
+### 12.1 连接手机时必须使用 ADB 调试
+
+- 只要电脑通过数据线连接了 Android 手机，并且用户开启了 USB 调试，开发、修复或验收 Android 功能时**必须使用 ADB 对真实设备进行调试**。不能只执行 Gradle 构建，也不能只在桌面浏览器或模拟器中判断 Android 功能正常。
+- 开始调试前先确认设备状态：
+
+```powershell
+adb devices -l
+```
+
+- 设备必须显示为 `device`。如果显示 `unauthorized`、`offline` 或设备列表为空，应先处理手机授权、数据线、USB 模式或 ADB 服务；不要把连接故障误判成应用故障。
+- 多设备连接时，后续命令必须使用 `adb -s <serial>` 指定已确认的目标手机。未授权时请用户在手机上确认，不得尝试绕过授权或锁屏。不要仅凭 `monkey` 的短时网络统计判断手机没有联网。
+- 安装测试包时优先覆盖安装，以保留用户测试数据：
+
+```powershell
+adb install -r .\android\app\build\outputs\apk\debug\YouXueBan-1.1.0-Android-test.apk
+adb shell am force-stop cn.edu.bupt.youxueban
+adb shell am start -n cn.edu.bupt.youxueban/.MainActivity
+```
+
+- 每次重新安装或应用进程重启后，都要重新确认进程和设备状态。USB 调试连接可能在手机锁屏、切换 USB 模式或应用重启后失效：
+
+```powershell
+adb shell pidof cn.edu.bupt.youxueban
+adb logcat -d -t 300
+```
+
+- 如需检查 WebView 页面，先打开 Android WebView 调试开关，再通过 ADB 转发对应的 `webview_devtools_remote_<pid>`；应用进程变化后必须重新转发端口。不要复用旧 PID 或旧调试连接。
+- WebView 调试仅限测试构建，正式发布包必须关闭。PowerShell 中使用 `$appPid` 保存应用进程号，不能赋值给只读变量 `$PID`。调试结束后移除本次创建的端口转发，不得清除用户应用数据或关闭无关设备的调试会话。
+
+### 12.2 Android 验收闭环
+
+涉及 Android 的改动必须完成以下闭环，缺一项都不能称为“Android 已修复”：
+
+1. 前端类型检查、Vite 构建和 Android Gradle 构建通过。
+2. 使用 ADB 将最新 APK 安装到真实连接的手机。
+3. 启动应用并确认首屏可见，不能只看进程存在；重点排查白屏、启动超时、WebView 资源 404 和 JavaScript 初始化异常。
+4. 使用 `adb logcat` 检查 `AndroidRuntime`、应用包名、WebView/Chromium 相关错误；不得把密码、Cookie、API Key、完整上游响应或个人数据写入日志。
+5. 对本次改动涉及的功能进行真实点击和真实请求测试，并记录接口状态、页面状态和错误状态。对校园功能至少区分：在线成功、成功但为空、使用缓存、鉴权失败、网络失败和超时取消。
+6. 对文件导入、通知、校园登录等 Android 特有流程进行页面级验收；必要时使用手机截图或 WebView 调试接口确认实际显示结果。
+7. 修改后再次覆盖安装并回归已有功能：首屏、昵称保存、任务、课程、课表导入、电费、信息门户、第二课堂、AI 配置与对话、设置删除和通知。
+8. ADB 断开时要明确记录哪些项目已完成代码/自动化验证，哪些项目尚未完成真机验证；不能用“构建成功”代替真机证据。
+
+验收结论必须对应具体构建与实际执行结果：接口返回 50 条不代表界面已成功展开 50 条；按钮等待超时、截图失败或设备断开都不能记为页面验收通过。每次修改源码后先重新构建再安装，记录 APK 路径、版本和校验值；不得把上一个 APK 的测试结果当作新构建的验证结果。Debug 测试包与正式签名发布包必须明确区分。
+
+### 12.3 Android WebView 与原生桥接要求
+
+- 本地页面应通过固定的安全本地源加载，例如 `https://appassets.androidplatform.net/` 配合资源拦截；不要依赖 `file://`、外部开发服务器或手机上的本机 IP。
+- UI WebView 与运行时 WebView 分离。UI 页面只能调用有限的 `request`、`notify` 等白名单接口；校园网页不能获得 Android 原生桥接对象。
+- 所有来自 UI 的路由、请求方法、请求体大小、外部 URL、重定向和 Header 都必须在 Android 原生层再次校验，不能信任 JavaScript 页面传来的限制。
+- Android 敏感配置必须使用 Android Keystore 或等价的安全存储；账号、密码、Cookie 和 API Key 不得写入 `localStorage`、明文文件、APK 资源或日志。
+- 原生网络层应设置连接和读取超时，限制响应体大小，处理有限次数的重定向，并在请求取消时中断底层连接。UI 的“取消”按钮不能只关闭弹窗而留下后台请求。
+- 校园登录 WebView 不能把不完整的 iframe 单独打开后假设认证完成。必须保留学校认证页面所需的外层上下文、Cookie、脚本和重定向关系；移动版登录页与桌面版字段、按钮和验证码结构可能不同，应分别适配。
+- Android 与 Windows 对同一个校园源可以收到不同模板。请求通知列表时不能默认移动模板与桌面模板数据等价；如果移动模板缺少部门、分页或完整字段，应在受控的请求 Header 下选择完整数据模板，并继续校验来源和 Cookie。
+- 解析器不能用“固定取前十条”代替分页。应识别实际分页参数、查询字符串相对链接和脚本加载更多机制，去重后再应用产品上限；通知对象必须从同一列表行提取标题、发布部门和日期，缺失字段要显示明确状态。
+- Android 系统返回键、文件选择器、通知权限、屏幕旋转、应用切后台和 WebView 渲染进程终止都属于必须考虑的生命周期场景。异常退出或渲染进程重启后不能留下永久“正在读取”状态。
+
+### 12.4 Android 构建和测试命令
+
+当前项目的 Android 构建脚本为：
+
+```powershell
+pwsh -NoProfile -File .\scripts\build-android.ps1 -SdkRoot "<Android-SDK>" -JavaHome "<JDK>" -Gradle "<gradle.bat>" -Offline
+```
+
+构建产物默认位于：
+
+```text
+android/app/build/outputs/apk/debug/YouXueBan-1.1.0-Android-test.apk
+```
+
+将占位符替换为实际路径，JDK 版本须与当前 Gradle/Android 插件兼容。`-Offline` 仅适用于所需依赖已缓存的环境；首次构建缺少依赖时应去掉该参数。APK 文件名随构建脚本和版本变化，以实际输出为准。
+
+构建脚本会先重新构建共享 Vue 页面，再生成 Android assets，最后执行 Gradle `assembleDebug`。不得直接修改 `android/app/src/main/assets/web/` 中的生成文件；应修改 `web/` 或 `android/runtime/` 后重新生成。
+
+### 12.5 已总结的 Android 易错点
+
+1. **白屏**：直接使用桌面网页但没有注入 `window.youxuebanRuntime`，会导致页面接口全部失败；Android 必须在页面加载前准备原生桥接，并为启动失败显示可读错误。
+2. **课表永久读取**：门户、课表和电费共用串行队列时，一个校园请求卡住会阻塞其他请求；不同业务请求应能独立超时，读取中的导入必须支持真实取消。
+3. **门户登录失败**：北邮统一认证移动页可能是 `login-mobile.html`，字段名称与桌面页不同；外层认证函数、iframe 上下文和 Cookie 不能被破坏。
+4. **门户只有十条**：移动模板可能只首屏返回十条，并通过脚本加载更多；如果需要与 Windows 端一致，应请求完整模板并正确解析 `PAGENUM` 等实际分页链接。
+5. **发布部门为空**：部门通常位于通知同一列表行的 `.author` 节点；不能从包含标题摘要的外层容器直接取整段文本，否则会把标题或省略文本当成部门。
+6. **电费失败**：电费页面依赖统一认证会话和对应域名 Cookie；门户登录、Cookie 域/路径、HTTP 与 HTTPS、重定向链任一处不一致都可能导致电费接口失败。
+7. **假阳性验证**：APK 能生成、能安装、首页能显示，都不代表课表、门户、电费、文件导入和 AI 可用；必须使用 ADB 在真实手机上逐项测试并保留结果。

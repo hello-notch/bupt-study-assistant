@@ -28,6 +28,12 @@ client/dist/
 client/.playwright-browsers/
 *.tsbuildinfo
 mobile/
+android/.gradle/
+android/local.properties
+android/**/build/
+android/app/src/main/assets/
+android/app/src/main/res/drawable/app_icon.png
+android/*.keystore
 
 # Local coding-agent workspace metadata
 .agents/

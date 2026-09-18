@@ -381,7 +381,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
   async function fetchPortalPages(cookies) {
     const [portalNotices, homeResponse] = await Promise.all([
       fetchPortalNotices(cookies),
-      fetch(PORTAL_HOME_URL, { headers: { Cookie: cookieHeaderForUrl(cookies, PORTAL_HOME_URL) }, redirect: "follow", signal: AbortSignal.timeout(25_000) }),
+      fetch(PORTAL_HOME_URL, { headers: portalRequestHeaders(cookies, PORTAL_HOME_URL), redirect: "follow", signal: AbortSignal.timeout(25_000) }),
     ]);
     const homeHtml = await decodeResponse(homeResponse);
     if (homeResponse.url.includes("auth.bupt.edu.cn/authserver/login") || /统一身份认证|authserver\/login/i.test(homeHtml)) {
@@ -399,7 +399,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
       const pageUrl = queue.shift();
       if (!pageUrl || visited.has(pageUrl)) continue;
       visited.add(pageUrl);
-      const response = await fetch(pageUrl, { headers: { Cookie: cookieHeaderForUrl(cookies, pageUrl) }, redirect: "follow", signal: AbortSignal.timeout(25_000) });
+      const response = await fetch(pageUrl, { headers: portalRequestHeaders(cookies, pageUrl), redirect: "follow", signal: AbortSignal.timeout(25_000) });
       const html = await decodeResponse(response);
       if (response.url.includes("auth.bupt.edu.cn/authserver/login") || /统一身份认证|authserver\/login/i.test(html)) {
         throw new CampusBrowserSessionExpired("信息门户统一认证会话已失效");
@@ -693,6 +693,15 @@ async function decodeResponse(response) {
   if (!response.ok) throw new Error(`官方服务返回 HTTP ${response.status}`);
   const buffer = Buffer.from(await response.arrayBuffer());
   try { return new TextDecoder("utf-8", { fatal: true }).decode(buffer); } catch { return new TextDecoder("gb18030").decode(buffer); }
+}
+
+function portalRequestHeaders(cookies, url) {
+  // The mobile portal template omits departments and uses script-only pagination.
+  // Request the complete template for data extraction, not for authentication.
+  return {
+    Cookie: cookieHeaderForUrl(cookies, url),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+  };
 }
 
 function parsePortalList(html, baseUrl) {
@@ -1014,5 +1023,5 @@ function bad(status, error) { return { status, body: { error } }; }
 
 module.exports = {
   createLocalRuntime,
-  __test: { activityDetailHtml, parsePortalList, activityRows, activityTokenFromPayload, fetchActivityList, toActivityItem, cookieHeaderForUrl, dataRows, electricityData, houseMatches, normalizeScheduleCourseName, normalizeScheduleWeeks, parseDormitory, parsePersonalSchedule, parseScheduleLines, portalPaginationUrls, roomMatches },
+  __test: { activityDetailHtml, parsePortalList, portalRequestHeaders, activityRows, activityTokenFromPayload, fetchActivityList, toActivityItem, cookieHeaderForUrl, dataRows, electricityData, houseMatches, normalizeScheduleCourseName, normalizeScheduleWeeks, parseDormitory, parsePersonalSchedule, parseScheduleLines, portalPaginationUrls, roomMatches },
 };
