@@ -5,9 +5,13 @@ export interface LocalRuntimeResult {
 
 declare global {
   interface Window {
+    __androidBack?: () => boolean;
     youxuebanRuntime?: {
-      request(route: string, init?: { method?: string; body?: string }): Promise<LocalRuntimeResult>;
+      request(route: string, init?: { method?: string; body?: string }, signal?: AbortSignal): Promise<LocalRuntimeResult>;
       notify?(title: string, body: string): Promise<boolean>;
+      setTheme?(dark: boolean): void;
+      syncReminders?(items: Array<{ id: string; at: number; title: string; body: string; silent?: boolean }>): boolean;
+      requestReminderPermissions?(): void;
     };
   }
 }
@@ -23,10 +27,22 @@ function apiUrl(path: string): string {
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const route = apiUrl(path);
   if (window.youxuebanRuntime) {
-    const result = await window.youxuebanRuntime.request(route, {
+    const signal = init.signal;
+    if (signal?.aborted) throw signal.reason;
+    const request = window.youxuebanRuntime.request(route, {
       method: init.method ?? "GET",
       body: typeof init.body === "string" ? init.body : undefined,
-    });
+    }, signal ?? undefined);
+    let onAbort: (() => void) | undefined;
+    let result: LocalRuntimeResult;
+    try {
+      result = await (signal ? Promise.race([request, new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+      })]) : request);
+    } finally {
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    }
     return new Response(JSON.stringify(result.body ?? {}), {
       status: result.status,
       headers: { "Content-Type": "application/json; charset=utf-8" },

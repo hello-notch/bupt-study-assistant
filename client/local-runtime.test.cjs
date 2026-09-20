@@ -52,6 +52,24 @@ test("portal pagination keeps only later pages from the notice list", () => {
   ]);
 });
 
+test("portal pagination resolves official query-only PAGENUM links", () => {
+  const base = "http://my.bupt.edu.cn/list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1154";
+  const html = '<a href="?totalpage=1598&amp;PAGENUM=2&amp;urltype=tree.TreeTempUrl&amp;wbtreeid=1154">下页</a>';
+  const [next] = __test.portalPaginationUrls(html, base);
+  assert.equal(new URL(next).pathname, "/list.jsp");
+  assert.equal(new URL(next).searchParams.get("PAGENUM"), "2");
+});
+
+test("portal data requests select the full template and scope cookies to the target", () => {
+  const headers = __test.portalRequestHeaders([
+    { name: "portal", value: "test", domain: "my.bupt.edu.cn", path: "/", expires: -1 },
+    { name: "auth", value: "private", domain: "auth.bupt.edu.cn", path: "/", expires: -1 },
+  ], "http://my.bupt.edu.cn/list.jsp");
+  assert.match(headers["User-Agent"], /Windows NT/);
+  assert.doesNotMatch(headers["User-Agent"], /Android|Mobile/);
+  assert.equal(headers.Cookie, "portal=test");
+});
+
 test("week parser removes the section suffix returned by jwgl", () => {
   assert.equal(__test.normalizeScheduleWeeks("1(周)[01-02-03-04-05-06节]"), "1");
   assert.equal(__test.normalizeScheduleWeeks("3-18(周)[03-04节]"), "3-18");
@@ -65,6 +83,43 @@ test("JWGL course name removes its leading dash separator", () => {
 test("activity rows accept the current nested list response", () => {
   assert.deepEqual(__test.activityRows({ data: { list: [{ id: 1 }] } }), [{ id: 1 }]);
   assert.deepEqual(__test.activityRows({ data: [] }), []);
+});
+
+test("activity browser login removes expired or rejected tokens only from the trusted activity origin", () => {
+  const vm = require("node:vm");
+  const token = exp => `header.${Buffer.from(JSON.stringify({ exp })).toString("base64url")}.signature`;
+  const valid = token(Math.floor(Date.now() / 1000) + 3600);
+  const expired = token(Math.floor(Date.now() / 1000) - 60);
+  const storage = new Map([["unrelated", "keep"]]);
+  const context = {
+    location: { origin: "https://dekt.bupt.edu.cn" }, atob,
+    document: { querySelector: () => ({}) },
+    localStorage: {
+      getItem: key => storage.get(key),
+      removeItem: key => storage.delete(key),
+    },
+  };
+  for (const rejected of [expired, "invalid.jwt.token", "header.payload", token(undefined)]) {
+    storage.set("secondclass.tokenv3", rejected);
+    const state = vm.runInNewContext(__test.activitySessionScript(), context);
+    assert.equal(state.token, "");
+    assert.equal(state.reset, true);
+    assert.equal(storage.has("secondclass.tokenv3"), false);
+    assert.equal(storage.get("unrelated"), "keep");
+  }
+  storage.set("secondclass.tokenv3", valid);
+  const reused = vm.runInNewContext(__test.activitySessionScript(), context);
+  assert.equal(reused.token, valid);
+  assert.equal(reused.reset, false);
+  const forced = vm.runInNewContext(__test.activitySessionScript(true), context);
+  assert.equal(forced.token, "");
+  assert.equal(forced.reset, true);
+  storage.set("secondclass.tokenv3", expired);
+  context.location.origin = "https://untrusted.example";
+  const blocked = vm.runInNewContext(__test.activitySessionScript(true), context);
+  assert.equal(blocked.token, "");
+  assert.equal(blocked.loginReady, false);
+  assert.equal(storage.get("secondclass.tokenv3"), expired);
 });
 
 const activityFixture = [
@@ -284,6 +339,119 @@ test("failed activity refresh retains the last genuine cache instead of reportin
   }
 });
 
+test("activity 401 recovery obtains a fresh browser token without clearing other campus sessions", async () => {
+  const vm = require("node:vm");
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "youxueban-activity-renew-"));
+  const originalFetch = global.fetch;
+  const claims = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url");
+  const rejectedToken = `old.${claims}.signature`;
+  const freshToken = `new.${claims}.signature`;
+  const storage = new Map([["secondclass.tokenv3", rejectedToken], ["unrelated", "keep"]]);
+  const requests = [];
+  let submissions = 0;
+  let cleared = 0;
+  class BrowserWindow {
+    destroyed = false;
+    async loadURL() {}
+    async show() {}
+    isDestroyed() { return this.destroyed; }
+    destroy() { this.destroyed = true; }
+    webContents = {
+      setUserAgent() {},
+      isLoadingMainFrame: () => false,
+      executeJavaScript: async script => {
+        if (script.includes("setValue(account,")) {
+          submissions++;
+          storage.set("secondclass.tokenv3", freshToken);
+          return true;
+        }
+        return vm.runInNewContext(script, {
+          location: { origin: "https://dekt.bupt.edu.cn" }, atob,
+          document: { querySelector: () => ({}) },
+          localStorage: { getItem: key => storage.get(key), removeItem: key => storage.delete(key) },
+        });
+      },
+    };
+  }
+  try {
+    fs.writeFileSync(path.join(temporaryRoot, "local-settings.bin"), JSON.stringify({
+      campus: { ssoAccount: "fixture", ssoPassword: "fixture", jwglAccount: "fixture", jwglPassword: "fixture", portalCookies: [{ expires: -1 }] },
+    }));
+    const runtime = createLocalRuntime({
+      app: { getPath: () => temporaryRoot }, BrowserWindow,
+      safeStorage: { isEncryptionAvailable: () => true, decryptString: value => value.toString() },
+      session: { fromPartition: () => ({ clearStorageData: async () => { cleared++; } }) },
+    });
+    global.fetch = async (address, init) => {
+      const url = new URL(address);
+      if (url.hostname === "my.bupt.edu.cn") throw new Error("Portal fixture unavailable");
+      if (url.pathname === "/api/v1/auth/sessions") return new Response("", { status: 420 });
+      assert.equal(url.pathname, "/api/v1/activity");
+      requests.push(init.headers.Authorization);
+      return init.headers.Authorization === `Bearer ${freshToken}`
+        ? Response.json({ data: [] }) : new Response("", { status: 401 });
+    };
+    const result = (await runtime.request("/api/campus")).body;
+    assert.equal(result.statuses.find(item => item.source === "activity").mode, "online");
+    assert.deepEqual(requests, [`Bearer ${rejectedToken}`, `Bearer ${freshToken}`]);
+    assert.equal(submissions, 1);
+    assert.equal(cleared, 0);
+    assert.equal(storage.get("unrelated"), "keep");
+  } finally {
+    global.fetch = originalFetch;
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("portal fetches fifty unique notices with departments across the full-template pages", async () => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "youxueban-portal-test-"));
+  const originalFetch = global.fetch;
+  const pages = [];
+  try {
+    fs.writeFileSync(path.join(temporaryRoot, "local-settings.bin"), JSON.stringify({
+      campus: {
+        ssoAccount: "test", ssoPassword: "test", jwglAccount: "test", jwglPassword: "test",
+        portalCookies: [{ name: "portal", value: "test", domain: "my.bupt.edu.cn", path: "/", expires: -1 }],
+      },
+    }));
+    const runtime = createLocalRuntime({
+      app: { getPath: () => temporaryRoot }, BrowserWindow: function () {}, session: {},
+      safeStorage: { isEncryptionAvailable: () => true, decryptString: value => value.toString() },
+    });
+    global.fetch = async (address, init) => {
+      const url = new URL(address);
+      let body = "";
+      if (url.hostname === "my.bupt.edu.cn") {
+        assert.match(init.headers["User-Agent"], /Windows NT/);
+        if (url.pathname === "/list.jsp") {
+          const page = Number(url.searchParams.get("PAGENUM") || 1);
+          pages.push(page);
+          // A pinned announcement is repeated on every page.
+          const ids = [1, ...Array.from({ length: 19 }, (_, i) => 2 + (page - 1) * 19 + i)];
+          body = `<ul>${ids.map(id => `<li><a href="xntz_content.jsp?wbnewsid=${id}">Notice ${id}</a><span class="author">Department ${id % 3}</span><span class="time">2026-09-16</span></li>`).join("")}</ul>`;
+          body += `<a href="?PAGENUM=${page + 1}&amp;wbtreeid=1154">下页</a>`;
+        }
+      } else {
+        assert.equal(init.headers["User-Agent"], undefined);
+        body = JSON.stringify(url.pathname.endsWith("/sessions") ? { token: "test.session.token" } : { status: "ok", data: [], error: null });
+      }
+      const response = new Response(body);
+      Object.defineProperty(response, "url", { value: url.href });
+      return response;
+    };
+    const result = await runtime.request("/api/campus");
+    assert.equal(result.status, 200);
+    assert.deepEqual(pages, [1, 2, 3]);
+    assert.equal(result.body.items.length, 50);
+    assert.equal(new Set(result.body.items.map(item => item.id)).size, 50);
+    assert.ok(result.body.items.every(item => /^Department [0-2]$/.test(item.source)));
+    assert.equal(result.body.statuses.find(status => status.source === "portal").mode, "online");
+  } finally {
+    global.fetch = originalFetch;
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("campus cookie header only sends cookies valid for the target URL", () => {
   const future = Date.now() / 1000 + 3600;
   const cookies = [
@@ -355,8 +523,26 @@ test("deleting campus credentials also removes the public account names", async 
     const result = await runtime.request("/api/local/settings/campus", { method: "DELETE" });
     assert.equal(result.status, 200);
     const status = (await runtime.request("/api/local/settings/status")).body;
-    assert.deepEqual(status.campus, { configured: false, ssoAccount: "", jwglAccount: "" });
+    assert.deepEqual(status.campus, { configured: false, ssoAccount: "", jwglAccount: "", accountKey: "" });
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }
+});
+test("Flash image capabilities and native attachment validation", () => {
+  const png = Buffer.from("89504e470d0a1a0a00000000", "hex");
+  const attachment = { mimeType: "image/png", size: png.length, dataUrl: `data:image/png;base64,${png.toString("base64")}` };
+  const messages = [{ role: "user", content: "describe", attachments: [attachment] }];
+  for (const model of ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]) {
+    assert.equal(__test.supportsImages(model), true);
+    assert.equal(__test.normalizeAssistantMessages(messages, model)[0].content[1].type, "image_url");
+  }
+  assert.throws(() => __test.normalizeAssistantMessages(messages, "deepseek-v4-pro"), /不支持图片/);
+  assert.throws(() => __test.normalizeAssistantMessages([{ ...messages[0], role: "assistant" }], "deepseek-flash"));
+  for (const bad of [
+    { ...attachment, size: 0 },
+    { ...attachment, mimeType: "image/jpeg" },
+    { ...attachment, dataUrl: "https://example.com/picture.png" },
+    { ...attachment, dataUrl: "data:image/png;base64,YmFk", size: 3 },
+  ]) assert.throws(() => __test.normalizeAssistantMessages([{ role: "user", attachments: [bad] }], "deepseek-flash"));
+  assert.throws(() => __test.normalizeAssistantMessages([{ role: "user", attachments: [attachment, attachment, attachment] }], "deepseek-flash"));
 });

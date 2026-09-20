@@ -4,6 +4,7 @@ const path = require("node:path");
 const { parseHTML } = require("linkedom");
 const { QuillDeltaToHtmlConverter } = require("quill-delta-to-html");
 const { authenticatePortalWithPlaywright, openCampusServiceWithPlaywright, CampusBrowserSessionExpired } = require("./playwright-auth.cjs");
+const { loadUcloudAssignments } = require("./ucloud.cjs");
 
 const PORTAL_LIST_URL = "http://my.bupt.edu.cn/list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1154";
 const PORTAL_HOME_URL = "http://my.bupt.edu.cn/";
@@ -15,6 +16,7 @@ const ELECTRICITY_URL = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
 const DEEPSEEK_API_URL = "https://api.deepseek.com";
 const DEEPSEEK_SUMMARY_MODEL = "deepseek-v4-flash";
 const DEEPSEEK_MODELS = Object.freeze([
+  "deepseek-flash",
   "deepseek-v4-flash",
   "deepseek-v4-pro",
   "deepseek-v4-flash-vision-exp",
@@ -28,6 +30,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
     jwgl: "persist:youxueban-jwgl",
     activity: "persist:youxueban-activity",
     electricity: "persist:youxueban-electricity",
+    ucloud: "persist:youxueban-ucloud",
   };
 
   function readSettings() {
@@ -52,6 +55,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
         configured: Boolean(value.campus?.ssoAccount && value.campus?.ssoPassword && value.campus?.jwglAccount && value.campus?.jwglPassword),
         ssoAccount: String(value.campus?.ssoAccount || ""),
         jwglAccount: String(value.campus?.jwglAccount || ""),
+        accountKey: value.campus?.ssoAccount ? createHash("sha256").update(value.campus.ssoAccount).digest("hex") : "",
       },
       ai: {
         configured: Boolean(value.ai?.apiKey),
@@ -98,6 +102,13 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
       if (route === "/api/assistant/chat" && method === "POST") return await assistantChat(body);
       if (route === "/api/assistant/title" && method === "POST") return await assistantTitle(body);
       if (route === "/api/courses/mine" && method === "POST") return await ownSchedule();
+      if (route === "/api/homework/sync" && method === "POST") {
+        const campus = requireCampusSettings();
+        const items = await loadUcloudAssignments({ window: await createCampusWindow("ucloud"), campus, interactive: body.interactive === true });
+        // Discard a response from a login that was removed/changed while loading.
+        if (readSettings().campus?.ssoAccount !== campus.ssoAccount) return bad(409, "校园账号已变更，请重新同步");
+        return ok({ items, complete: true, accountKey: createHash("sha256").update(campus.ssoAccount).digest("hex"), updatedAt: new Date().toISOString() });
+      }
       if (route === "/api/campus" && method === "GET") return await campusItems();
       if (route === "/api/campus/relogin" && method === "POST") return await reloginCampus();
       if (route === "/api/electricity/query" && method === "POST") return await electricityQuery(body);
@@ -163,7 +174,9 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
   async function assistantChat(body) {
     const ai = configuredAi();
     if (!ai) return bad(503, "请先配置 DeepSeek API Key 并选择模型");
-    const messages = normalizeAssistantMessages(body.messages);
+    let messages;
+    try { messages = normalizeAssistantMessages(body.messages, ai.model); }
+    catch (error) { return bad(400, safeError(error)); }
     if (!messages.length) return bad(400, "消息不能为空");
     const system = [
       "你是‘邮学伴’，北邮学生的学习助手请用简洁自然的中文回答",
@@ -181,7 +194,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
         temperature: 0.65,
         max_tokens: 1200,
         ...(tools.length ? { tools, tool_choice: "auto" } : {}),
-        ...(body.thinking === true ? { thinking: { type: "enabled" } } : {}),
+        thinking: { type: body.thinking === true ? "enabled" : "disabled" },
       }),
       signal: AbortSignal.timeout(60_000),
     });
@@ -278,7 +291,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
       thinkingSupported: true,
       thinkingEnabled: false,
       webSearchEnabled: false,
-      allowedFileTypes: ai.model === "deepseek-v4-flash-vision-exp" ? ["image/png", "image/jpeg", "image/webp"] : [],
+      allowedFileTypes: supportsImages(ai.model) ? ["image/png", "image/jpeg", "image/webp"] : [],
       contextWindow: 128_000,
       maxOutputTokens: 1200,
       contextBlockThreshold: 115_200,
@@ -368,7 +381,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
   async function portalSessionCookies(campus, forceRefresh = false) {
     let cookies = Array.isArray(campus.portalCookies) ? campus.portalCookies : [];
     if (!forceRefresh && cookies.some((cookie) => !Number(cookie.expires) || Number(cookie.expires) < 0 || Number(cookie.expires) > Date.now() / 1000)) return cookies;
-    cookies = await authenticatePortalWithPlaywright({ startUrl: PORTAL_LIST_URL, account: campus.ssoAccount, password: campus.ssoPassword });
+    cookies = await authenticatePortalWithPlaywright({ startUrl: PORTAL_LIST_URL, account: campus.ssoAccount, password: campus.ssoPassword, forceRefresh });
     const value = readSettings();
     if (value.campus) {
       value.campus.portalCookies = cookies;
@@ -381,7 +394,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
   async function fetchPortalPages(cookies) {
     const [portalNotices, homeResponse] = await Promise.all([
       fetchPortalNotices(cookies),
-      fetch(PORTAL_HOME_URL, { headers: { Cookie: cookieHeaderForUrl(cookies, PORTAL_HOME_URL) }, redirect: "follow", signal: AbortSignal.timeout(25_000) }),
+      fetch(PORTAL_HOME_URL, { headers: portalRequestHeaders(cookies, PORTAL_HOME_URL), redirect: "follow", signal: AbortSignal.timeout(25_000) }),
     ]);
     const homeHtml = await decodeResponse(homeResponse);
     if (homeResponse.url.includes("auth.bupt.edu.cn/authserver/login") || /统一身份认证|authserver\/login/i.test(homeHtml)) {
@@ -399,7 +412,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
       const pageUrl = queue.shift();
       if (!pageUrl || visited.has(pageUrl)) continue;
       visited.add(pageUrl);
-      const response = await fetch(pageUrl, { headers: { Cookie: cookieHeaderForUrl(cookies, pageUrl) }, redirect: "follow", signal: AbortSignal.timeout(25_000) });
+      const response = await fetch(pageUrl, { headers: portalRequestHeaders(cookies, pageUrl), redirect: "follow", signal: AbortSignal.timeout(25_000) });
       const html = await decodeResponse(response);
       if (response.url.includes("auth.bupt.edu.cn/authserver/login") || /统一身份认证|authserver\/login/i.test(html)) {
         throw new CampusBrowserSessionExpired("信息门户统一认证会话已失效");
@@ -428,12 +441,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
     const realStatus = Number(response.headers.get("x-real-status") || response.status);
     let token = "";
     if (realStatus === 419 || realStatus === 420) {
-      try {
-        token = await loginActivityInBrowser(campus);
-      } catch {
-        await session.fromPartition(partitions.activity).clearStorageData({ storages: ["cookies", "localstorage"] });
-        token = await loginActivityInBrowser(campus);
-      }
+      token = await loginActivityInBrowser(campus);
     } else {
       if (!response.ok || realStatus >= 400) throw new Error(`登录失败（HTTP ${realStatus}）`);
       const login = await response.json();
@@ -444,23 +452,25 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
       return await fetchActivityList(token);
     } catch (error) {
       if (!(error instanceof CampusBrowserSessionExpired)) throw error;
-      await session.fromPartition(partitions.activity).clearStorageData({ storages: ["cookies", "localstorage"] });
-      return await fetchActivityList(await loginActivityInBrowser(campus));
+      return await fetchActivityList(await loginActivityInBrowser(campus, true));
     }
   }
 
-  async function loginActivityInBrowser(campus) {
+  async function loginActivityInBrowser(campus, forceRefresh = false) {
     const window = await createCampusWindow("activity");
     try {
       await loadCampusPage(window, ACTIVITY_URL);
+      const state = await window.webContents.executeJavaScript(activitySessionScript(forceRefresh));
+      // Remove the token in the live origin before reloading the SPA's in-memory session.
+      if (state.reset) await loadCampusPage(window, ACTIVITY_URL);
       // The SPA may still be routing after the document has finished loading.
       const existingToken = await waitForPageValue(window, `(() => {
-        const token = localStorage.getItem('secondclass.tokenv3') || '';
-        if (token.split('.').length === 3) return token;
-        return document.querySelector('input[type="password"]') ? true : false;
+        const state = ${activitySessionScript()};
+        return state.token || state.loginReady;
       })()`, (value) => Boolean(value), 20_000, "第二课堂登录页面未就绪，请稍后重试");
       if (typeof existingToken === "string") return existingToken;
       const submitted = await window.webContents.executeJavaScript(`(() => {
+        if (location.origin !== 'https://dekt.bupt.edu.cn') return false;
         const account = document.querySelector('input[placeholder*="学工号"], input[name="username"], input[type="text"]');
         const password = document.querySelector('input[placeholder*="密码"], input[name="password"], input[type="password"]');
         if (!account || !password) return false;
@@ -478,7 +488,8 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
         return true;
       })()`);
       if (!submitted) throw new Error("第二课堂登录页面结构已变化");
-      return await waitForPageValue(window, `localStorage.getItem('secondclass.tokenv3') || ''`, (value) => typeof value === "string" && value.split(".").length === 3, 35_000, "第二课堂登录未完成，请检查账号密码或验证码");
+      await window.show();
+      return await waitForPageValue(window, `(${activitySessionScript()}).token`, (value) => Boolean(value), 120_000, "第二课堂登录未完成，请在官方登录窗口完成验证码后重试");
     } finally {
       if (!window.isDestroyed()) window.destroy();
     }
@@ -594,13 +605,36 @@ function normalizeDeepSeekModel(value) {
   return DEEPSEEK_MODELS.includes(model) ? model : DEEPSEEK_MODELS[0];
 }
 
-function normalizeAssistantMessages(value) {
+function supportsImages(model) {
+  return ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"].includes(model);
+}
+
+function normalizeAssistantMessages(value, model) {
   if (!Array.isArray(value)) return [];
+  let totalImageBytes = 0;
   return value.slice(-30).map((message) => {
     const role = ["user", "assistant", "tool"].includes(message?.role) ? message.role : "user";
+    const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+    if (attachments.length) {
+      if (role !== "user" || !supportsImages(model)) throw new Error("当前模型不支持图片，请切换到 deepseek-flash");
+      if (attachments.length > 2) throw new Error("每条消息最多上传 2 张图片");
+      for (const item of attachments) {
+        const data = String(item?.dataUrl || "");
+        if (data.length > 1_334_000) throw new Error("单张图片压缩后不能超过 1 MB");
+        const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(data);
+        if (!match || match[1] !== item.mimeType) throw new Error("图片格式无效");
+        let bytes;
+        try { bytes = atob(match[2]); } catch { throw new Error("图片编码无效"); }
+        const signature = match[1] === "image/png" ? bytes.startsWith("\x89PNG\r\n\x1a\n") :
+          match[1] === "image/jpeg" ? bytes.startsWith("\xff\xd8\xff") :
+          bytes.startsWith("RIFF") && bytes.slice(8, 12) === "WEBP";
+        if (!signature || bytes.length !== item.size || bytes.length > 1_000_000) throw new Error("图片内容或大小无效");
+        totalImageBytes += bytes.length;
+        if (totalImageBytes > 12_000_000) throw new Error("对话图片总量过大，请新建对话");
+      }
+    }
     if (role === "tool") return { role, tool_call_id: String(message.tool_call_id || ""), content: String(message.content || "").slice(0, 12000) };
     if (role === "assistant" && Array.isArray(message.tool_calls)) return { role, content: message.content || null, tool_calls: message.tool_calls.slice(0, 8) };
-    const attachments = Array.isArray(message?.attachments) ? message.attachments.slice(0, 2) : [];
     if (!attachments.length) return { role, content: String(message?.content || "").slice(0, 12000) };
     return { role, content: [{ type: "text", text: String(message?.content || "请分析这张图片").slice(0, 12000) }, ...attachments.map((item) => ({ type: "image_url", image_url: { url: String(item.dataUrl || "") } }))] };
   });
@@ -693,6 +727,15 @@ async function decodeResponse(response) {
   if (!response.ok) throw new Error(`官方服务返回 HTTP ${response.status}`);
   const buffer = Buffer.from(await response.arrayBuffer());
   try { return new TextDecoder("utf-8", { fatal: true }).decode(buffer); } catch { return new TextDecoder("gb18030").decode(buffer); }
+}
+
+function portalRequestHeaders(cookies, url) {
+  // The mobile portal template omits departments and uses script-only pagination.
+  // Request the complete template for data extraction, not for authentication.
+  return {
+    Cookie: cookieHeaderForUrl(cookies, url),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+  };
 }
 
 function parsePortalList(html, baseUrl) {
@@ -826,6 +869,28 @@ function activityRows(payload) {
     if (Object.hasOwn(payload, key)) return activityRows(payload[key]);
   }
   throw new Error("活动列表数据格式已变化");
+}
+
+function activitySessionScript(forceRefresh = false) {
+  return `(() => {
+    if (location.origin !== 'https://dekt.bupt.edu.cn') return { token: '', reset: false, loginReady: false };
+    const key = 'secondclass.tokenv3';
+    let token = localStorage.getItem(key) || '';
+    let reset = ${forceRefresh ? "true" : "false"};
+    if (token) {
+      try {
+        const parts = token.split('.');
+        if (parts.length !== 3) throw new Error();
+        const claims = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        if (!claims || typeof claims !== 'object' || !Number.isFinite(claims.exp) || claims.exp * 1000 <= Date.now()) reset = true;
+      } catch { reset = true; }
+    }
+    if (reset) {
+      localStorage.removeItem(key);
+      token = '';
+    }
+    return { token, reset, loginReady: Boolean(document.querySelector('input[type="password"]')) };
+  })()`;
 }
 
 async function fetchActivityList(token) {
@@ -1014,5 +1079,5 @@ function bad(status, error) { return { status, body: { error } }; }
 
 module.exports = {
   createLocalRuntime,
-  __test: { activityDetailHtml, parsePortalList, activityRows, activityTokenFromPayload, fetchActivityList, toActivityItem, cookieHeaderForUrl, dataRows, electricityData, houseMatches, normalizeScheduleCourseName, normalizeScheduleWeeks, parseDormitory, parsePersonalSchedule, parseScheduleLines, portalPaginationUrls, roomMatches },
+  __test: { activitySessionScript, normalizeAssistantMessages, supportsImages, activityDetailHtml, parsePortalList, portalRequestHeaders, activityRows, activityTokenFromPayload, fetchActivityList, toActivityItem, cookieHeaderForUrl, dataRows, electricityData, houseMatches, normalizeScheduleCourseName, normalizeScheduleWeeks, parseDormitory, parsePersonalSchedule, parseScheduleLines, portalPaginationUrls, roomMatches },
 };

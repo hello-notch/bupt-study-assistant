@@ -1,0 +1,44 @@
+plugins {
+    id "com.android.application"
+}
+
+def releaseSigning = new Properties()
+def releaseSigningFile = rootProject.file("../secrets/android-release.properties")
+if (releaseSigningFile.exists()) {
+    releaseSigningFile.withInputStream { releaseSigning.load(it) }
+}
+
+android {
+    namespace "cn.edu.bupt.youxueban"
+    compileSdk 35
+    buildToolsVersion "35.0.0"
+
+    defaultConfig {
+        applicationId "cn.edu.bupt.youxueban"
+        minSdk 30
+        targetSdk 35
+        versionCode 12000
+        versionName "1.2.0"
+    }
+    signingConfigs {
+        release {
+            if (releaseSigningFile.exists()) {
+                storeFile rootProject.file(releaseSigning.getProperty("storeFile"))
+                storePassword releaseSigning.getProperty("storePassword")
+                keyAlias releaseSigning.getProperty("keyAlias")
+                keyPassword releaseSigning.getProperty("keyPassword")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            debuggable false
+            signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
