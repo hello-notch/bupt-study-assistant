@@ -78,6 +78,7 @@ async function nativeFetch(input, init = {}) {
   const headers = Object.fromEntries(new Headers(init.headers).entries());
   const result = await call("fetch", {
     url: String(input), method: init.method || "GET", headers,
+    redirect: init.redirect || "follow",
     body: init.body == null ? null : String(init.body),
   }, init.signal);
   const bytes = Uint8Array.from(atob(result.body), (c) => c.charCodeAt(0));

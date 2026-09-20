@@ -6,6 +6,8 @@ import IconGlyph from "./components/IconGlyph.vue";
 import { renderAssistantContent } from "./assistant-markdown";
 import { courseTimes, isSameCourseSession, normalizeImportedCourses, normalizeWeeks, parseCourseFile, type ImportedCourse } from "./course-import";
 import { apiFetch } from "./auth";
+import { scheduleLayout } from "./schedule-layout";
+import { canDeleteTask, compareTasks, isHomeworkSnapshot, reconcileHomework, sameHomeworkCourse } from "./homework";
 import { TEXTS } from "./texts";
 import type {
   AssistantAttachment,
@@ -64,7 +66,7 @@ interface AssistantToolResult {
   [key: string]: unknown;
 }
 interface LocalSettingsStatus {
-  campus: { configured: boolean; ssoAccount: string; jwglAccount: string };
+  campus: { configured: boolean; ssoAccount: string; jwglAccount: string; accountKey?: string };
   ai: { configured: boolean; baseUrl: string; model: string };
 }
 
@@ -92,7 +94,7 @@ const assistantTools: Array<Record<string, unknown>> = [
     end_section: { type: "integer", minimum: 1, maximum: 20 }, weeks: { type: "string" }, reminder_minutes: { type: "integer", minimum: 0, maximum: 10080 },
   }, ["name", "weekday", "start_section", "end_section", "weeks"]),
   assistantFunction("ddl_list", "查看当前未完成或全部 DDL", {
-    status: { type: "string", enum: ["todo", "done", "all"] },
+    status: { type: "string", enum: ["todo", "done", "submitted", "all"] },
   }, []),
   assistantFunction("ddl_show", "查看一条 DDL", { ddl_id: { type: "integer", minimum: 1 } }, ["ddl_id"]),
   assistantFunction("ddl_add", "添加 DDL；deadline 支持 1分钟后、明天15:30 或 ISO 时间，reminder_minutes=0 表示截止时提醒", {
@@ -117,8 +119,8 @@ function assistantFunction(name: string, description: string, properties: Record
   return { type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } };
 }
 
-const STORAGE_KEY = "youxueban-state-v9";
-const LEGACY_STORAGE_KEYS = ["youxueban-state-v8", "youxueban-state-v7", "youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
+const STORAGE_KEY = "youxueban-state-v10";
+const LEGACY_STORAGE_KEYS = ["youxueban-state-v9", "youxueban-state-v8", "youxueban-state-v7", "youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
 const MAX_ASSISTANT_FILE_SIZE = 1_000_000;
 const MAX_ASSISTANT_ATTACHMENTS = 2;
 const ASSISTANT_TOKEN_ESTIMATE_OVERHEAD = 300;
@@ -193,6 +195,11 @@ const saved = (() => {
 const initialPageHash = location.hash.replace("#/", "") as PageId;
 const initialPage = [...navItems.map((item) => item.id), "notifications", "settings"].includes(initialPageHash) ? initialPageHash : "today";
 const currentPage = ref<PageId>(initialPage);
+const pageHistory: PageId[] = [];
+const isAndroidRuntime = Boolean(window.youxuebanRuntime?.syncReminders);
+function requestNativeReminderPermissions(): void {
+  window.youxuebanRuntime?.requestReminderPermissions?.();
+}
 let pageSwipe: { x: number; y: number; startedAt: number; page: PageId } | null = null;
 const sidebarRef = ref<HTMLElement | null>(null);
 const sidebarGlider = ref({ top: 0, height: 46, visible: false });
@@ -259,8 +266,21 @@ const courseAddOpen = ref(false);
 const courseEditing = ref(false);
 const courseForm = ref<Omit<Course, "id">>(blankCourse());
 const pendingCourseSlot = ref<{ weekday: number; startSection: number } | null>(null);
-const taskFilter = ref<"todo" | "all" | "done">("todo");
+const taskFilter = ref<"todo" | "all" | "done" | "submitted">("todo");
 const taskSearch = ref("");
+const homeworkCourse = ref("");
+const homeworkBusy = ref(false);
+const homeworkError = ref("");
+const homeworkUpdatedAt = ref("");
+const selectedHomeworkId = ref<number | null>(null);
+const selectedHomework = computed(() => tasks.value.find(task => task.id === selectedHomeworkId.value && task.homework));
+const homeworkDetailHtml = computed(() => DOMPurify.sanitize(selectedHomework.value?.homework?.contentHtml || "", {
+  ALLOWED_TAGS: ["p", "br", "div", "span", "strong", "b", "em", "i", "u", "s", "h1", "h2", "h3", "h4", "ul", "ol", "li", "blockquote", "pre", "code", "table", "thead", "tbody", "tr", "th", "td", "img", "a", "sub", "sup"],
+  ALLOWED_ATTR: ["href", "src", "alt", "title", "colspan", "rowspan"],
+}));
+let homeworkController: AbortController | null = null;
+let homeworkTimer: number | undefined;
+let homeworkLastAttempt = 0;
 const campusTab = ref<"notice" | "activity">("notice");
 const campusSearch = ref("");
 const campusBusy = ref(false);
@@ -277,6 +297,7 @@ const assistantMode = ref<"unknown" | "online" | "error">("unknown");
 const assistantError = ref("");
 const assistantRuntime = ref<AssistantRuntimeInfo | null>(null);
 const assistantAttachments = ref<AssistantAttachment[]>([]);
+const assistantFilesBusy = ref(false);
 const assistantFileInput = ref<HTMLInputElement | null>(null);
 const assistantTextarea = ref<HTMLTextAreaElement | null>(null);
 const assistantChatPanel = ref<HTMLElement | null>(null);
@@ -359,13 +380,15 @@ const greeting = computed(() => {
 });
 const profileInitial = computed(() => profileName.value.trim().slice(0, 1) || "邮");
 const unreadCount = computed(() => notifications.value.filter((item) => !item.read).length);
-const todoTasks = computed(() => tasks.value.filter((task) => task.status === "todo").sort((a, b) => a.dueAt.localeCompare(b.dueAt)));
+const accountTasks = computed(() => tasks.value.filter(task => !task.homework || task.homework.accountKey === localSettings.value.campus.accountKey));
+const todoTasks = computed(() => accountTasks.value.filter((task) => task.status === "todo").sort(compareTasks));
 const currentAcademicWeek = computed(() => weekNumberFor(clock.value));
 const weekStart = computed(() => academicWeekMonday(selectedWeek.value));
 const weekDates = computed(() => weekdays.map((label, index) => ({ label, date: addDays(weekStart.value, index) })));
 const visibleCourses = computed(() => courses.value
   .filter((course) => courseOccursInWeek(course, selectedWeek.value))
   .sort((a, b) => a.weekday - b.weekday || a.startSection - b.startSection));
+const compactSchedule = computed(() => scheduleLayout(visibleCourses.value));
 const todayCourses = computed(() => courses.value
   .filter((course) => course.weekday === todayWeekday.value && courseOccursInWeek(course, currentAcademicWeek.value))
   .sort((a, b) => a.startSection - b.startSection));
@@ -409,10 +432,11 @@ const assistantTokenLabel = computed(() => {
 });
 const filteredTasks = computed(() => {
   const query = taskSearch.value.trim().toLowerCase();
-  return tasks.value
+  return accountTasks.value
     .filter((task) => taskFilter.value === "all" || task.status === taskFilter.value)
+    .filter(task => !homeworkCourse.value || (task.homework && sameHomeworkCourse(task.course, homeworkCourse.value)))
     .filter((task) => !query || `${task.title} ${task.course}`.toLowerCase().includes(query))
-    .sort((a, b) => a.dueAt.localeCompare(b.dueAt));
+    .sort(compareTasks);
 });
 const filteredCampusItems = computed(() => {
   const query = campusSearch.value.trim().toLowerCase();
@@ -473,6 +497,7 @@ watch([profileName, profileAvatar, tasks, courses, campusItems, notifications, p
 }, { deep: true });
 
 watch(() => preferences.value.theme, applyTheme, { immediate: true });
+watch([accountTasks, courses, preferences], syncNativeReminders, { deep: true });
 watch(() => preferences.value.reduceMotion, async (reduceMotion) => {
   applyMotionPreference();
   if (reduceMotion) {
@@ -485,6 +510,13 @@ watch(() => preferences.value.reduceMotion, async (reduceMotion) => {
 watch(currentPage, () => {
   updateSidebarGlider();
   updateConversationGlider();
+  if (currentPage.value === "tasks") refreshHomeworkWhenVisible();
+});
+watch(() => localSettings.value.campus.accountKey, () => {
+  homeworkController?.abort();
+  selectedHomeworkId.value = null;
+  homeworkUpdatedAt.value = "";
+  homeworkError.value = "";
 });
 watch([activeConversationId, () => listedAssistantConversations.value.length], () => updateConversationGlider());
 watch(accountBindingOpen, (open, previous) => {
@@ -511,6 +543,9 @@ watch(profileName, async (name) => {
 });
 
 onMounted(async () => {
+  window.__androidBack = handleAndroidBack;
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+  syncNativeReminders();
   if ("scrollRestoration" in history) history.scrollRestoration = "manual";
   window.scrollTo({ top: 0, behavior: "auto" });
   clockTimer = window.setInterval(() => { clock.value = new Date(); }, 1000);
@@ -519,6 +554,10 @@ onMounted(async () => {
   document.addEventListener("visibilitychange", checkRemindersWhenVisible);
   checkDueReminders();
   await refreshLocalSettings();
+  homeworkTimer = window.setInterval(refreshHomeworkWhenVisible, 5 * 60_000);
+  window.addEventListener("focus", refreshHomeworkWhenVisible);
+  document.addEventListener("visibilitychange", refreshHomeworkWhenVisible);
+  if (localSettings.value.campus.configured) void syncHomework();
   if (localSettings.value.ai.configured) void detectAiModels();
   try {
     const response = await apiFetch("/api/config");
@@ -548,6 +587,12 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  delete window.__androidBack;
+  window.matchMedia("(prefers-color-scheme: dark)").removeEventListener("change", applyTheme);
+  homeworkController?.abort();
+  if (homeworkTimer !== undefined) window.clearInterval(homeworkTimer);
+  window.removeEventListener("focus", refreshHomeworkWhenVisible);
+  document.removeEventListener("visibilitychange", refreshHomeworkWhenVisible);
   if (clockTimer !== undefined) window.clearInterval(clockTimer);
   if (reminderTimer !== undefined) window.clearInterval(reminderTimer);
   if (resetConfirmTimer !== undefined) window.clearTimeout(resetConfirmTimer);
@@ -567,9 +612,56 @@ onBeforeUnmount(() => {
   stopWelcomeOrbs();
 });
 
+function refreshHomeworkWhenVisible(): void {
+  if (document.visibilityState === "visible" && localSettings.value.campus.configured && Date.now() - homeworkLastAttempt > 30_000) void syncHomework();
+}
+
+function cancelHomeworkSync(): void {
+  homeworkController?.abort();
+}
+
+async function syncHomework(interactive = false): Promise<void> {
+  if (homeworkBusy.value) return;
+  if (!localSettings.value.campus.configured) { if (interactive) openAccountBinding(); return; }
+  const accountKey = localSettings.value.campus.accountKey;
+  const controller = new AbortController();
+  homeworkController = controller;
+  homeworkBusy.value = true;
+  homeworkError.value = "";
+  homeworkLastAttempt = Date.now();
+  const timer = window.setTimeout(() => controller.abort(), 170_000);
+  try {
+    const response = await apiFetch("/api/homework/sync", { method: "POST", body: JSON.stringify({ interactive }), signal: controller.signal });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "教学云同步失败");
+    if (!isHomeworkSnapshot(payload)) throw new Error("教学云同步数据不完整，已保留现有作业");
+    if (controller.signal.aborted || accountKey !== localSettings.value.campus.accountKey || payload.accountKey !== accountKey) return;
+    tasks.value = reconcileHomework(tasks.value, payload, preferences.value.defaultTaskReminder);
+    homeworkUpdatedAt.value = payload.updatedAt;
+    checkDueTaskReminders();
+  } catch (error) {
+    if (accountKey === localSettings.value.campus.accountKey)
+      homeworkError.value = controller.signal.aborted ? "同步已取消或超时，已保留现有作业" : error instanceof Error ? error.message : "教学云同步失败，已保留现有作业";
+  } finally {
+    window.clearTimeout(timer);
+    if (homeworkController === controller) homeworkController = null;
+    homeworkBusy.value = false;
+  }
+}
+
+function viewCourseHomework(): void {
+  if (!selectedCourse.value) return;
+  homeworkCourse.value = selectedCourse.value.name;
+  taskSearch.value = "";
+  taskFilter.value = "all";
+  selectedCourse.value = null;
+  navigate("tasks");
+}
+
 function applyTheme(): void {
   const theme = preferences.value.theme;
   document.documentElement.dataset.theme = theme === "system" ? "" : theme;
+  window.youxuebanRuntime?.setTheme?.(theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches));
 }
 
 function applyMotionPreference(): void {
@@ -784,13 +876,29 @@ function isCampusItemReadable(item: CampusItem): boolean {
   return Boolean(item.title.trim()) && !/(?:\uFFFD{2,}|��|锟斤拷|鍖椾含)/.test(text);
 }
 
-function navigate(page: PageId): void {
+function navigate(page: PageId, recordHistory = true): void {
+  if (recordHistory && currentPage.value !== page) pageHistory.push(currentPage.value);
   clearTaskDeleteConfirmation();
   window.scrollTo({ top: 0, behavior: "auto" });
   currentPage.value = page;
   location.hash = `/${page}`;
   if (page === "assistant" && !localSettings.value.ai.configured) openAiConfig();
   void nextTick(() => window.scrollTo({ top: 0, behavior: "auto" }));
+}
+
+function handleAndroidBack(): boolean {
+  if (aiConfigOpen.value) { aiConfigOpen.value = false; return true; }
+  if (accountBindingOpen.value) { accountBindingOpen.value = false; return true; }
+  if (selectedHomeworkId.value !== null) { selectedHomeworkId.value = null; return true; }
+  if (taskModalOpen.value) { taskModalOpen.value = false; return true; }
+  if (courseImportOpen.value) { cancelImport(); return true; }
+  if (courseAddOpen.value) { courseAddOpen.value = false; return true; }
+  if (selectedCourse.value && courseEditing.value) { courseEditing.value = false; return true; }
+  if (selectedCourse.value) { selectedCourse.value = null; return true; }
+  const previous = pageHistory.pop();
+  if (previous) { navigate(previous, false); return true; }
+  if (currentPage.value !== "today") { navigate("today", false); return true; }
+  return false;
 }
 
 function updateSidebarGlider(): void {
@@ -954,6 +1062,7 @@ async function saveAccountBinding(): Promise<void> {
     accountBindingForm.value.ssoPassword = "";
     accountBindingForm.value.jwglPassword = "";
     showToast(TEXTS.auth.saved);
+    void syncHomework();
     void loadCampusData();
   } catch (error) {
     accountBindingError.value = error instanceof Error ? error.message : TEXTS.auth.saveFailed;
@@ -1302,6 +1411,7 @@ function clearCourses(): void {
 }
 
 function formatDateTime(value: string): string {
+  if (!value) return "未设置截止时间";
   const date = new Date(value);
   const today = new Date();
   const tomorrow = new Date();
@@ -1313,6 +1423,7 @@ function formatDateTime(value: string): string {
 }
 
 function relativeDue(value: string): string {
+  if (!value) return "未设置截止时间";
   const diff = new Date(value).getTime() - Date.now();
   if (diff < 0) return "已逾期";
   if (diff < 60 * 60 * 1000) return `${Math.max(1, Math.ceil(diff / 60000))} 分钟后`;
@@ -1355,6 +1466,7 @@ function formatCampusDate(value: string, withTime = false): string {
 }
 
 function openTaskEdit(task: StudyTask): void {
+  if (task.homework) return;
   clearTaskDeleteConfirmation();
   editingTaskId.value = task.id;
   taskForm.value = {
@@ -1381,7 +1493,7 @@ function createTask(): void {
   const reminderMinutes = taskForm.value.reminderMinutes == null ? null : Math.max(0, Math.min(10080, Number(taskForm.value.reminderMinutes)));
   if (editingTaskId.value !== null) {
     const task = tasks.value.find((item) => item.id === editingTaskId.value);
-    if (task) {
+    if (task && !task.homework) {
       Object.assign(task, { title, course: taskForm.value.course.trim() || "个人计划", dueAt: dueAt.toISOString(), reminderMinutes, remindDuringQuiet: taskForm.value.remindDuringQuiet, status: "todo" });
       taskModalOpen.value = false;
       editingTaskId.value = null;
@@ -1410,13 +1522,43 @@ function checkDueReminders(): void {
   checkDueCourseReminders();
 }
 
+function syncNativeReminders(): void {
+  const runtime = window.youxuebanRuntime;
+  if (!runtime?.syncReminders) return;
+  const items: Array<{ id: string; at: number; title: string; body: string }> = [];
+  const now = Date.now();
+  if (preferences.value.browserNotifications) {
+    for (const task of accountTasks.value) {
+      if (task.status !== "todo" || task.reminderMinutes == null) continue;
+      const at = new Date(task.dueAt).getTime() - task.reminderMinutes * 60_000;
+      if (!Number.isFinite(at) || at < now || (!task.remindDuringQuiet && isQuietTime(new Date(at)))) continue;
+      items.push({ id: `task:${task.id}:${at}`, at, title: task.reminderMinutes === 0 ? "DDL 到期提醒" : "DDL 提前提醒",
+        body: `${task.title}（截止 ${formatDateTime(task.dueAt)}）` });
+    }
+    for (let week = 1; week <= MAX_ACADEMIC_WEEK; week++) {
+      for (const course of courses.value) {
+        if (course.reminderMinutes == null || !courseOccursInWeek(course, week)) continue;
+        const start = addDays(academicWeekMonday(week), course.weekday - 1);
+        const [hour, minute] = course.startTime.split(":").map(Number);
+        start.setHours(hour || 0, minute || 0, 0, 0);
+        const at = start.getTime() - course.reminderMinutes * 60_000;
+        if (at < now || isQuietTime(new Date(at))) continue;
+        items.push({ id: `course:${course.id}:${at}`, at, title: course.reminderMinutes === 0 ? "课程开始提醒" : "课程提前提醒",
+          body: `${course.name}（${formatDateTime(start.toISOString())}，${course.location}）` });
+      }
+    }
+  }
+  if (!runtime.syncReminders(items.sort((a, b) => a.at - b.at).map(item => ({ ...item, silent: !preferences.value.soundNotifications }))))
+    showToast("系统提醒保存失败，请重新打开应用后重试");
+}
+
 function checkRemindersWhenVisible(): void {
   if (document.visibilityState === "visible") checkDueReminders();
 }
 
 function checkDueTaskReminders(): void {
   const now = Date.now();
-  for (const task of tasks.value) {
+  for (const task of accountTasks.value) {
     if (task.status !== "todo" || task.reminderMinutes == null) continue;
     const dueAt = new Date(task.dueAt).getTime();
     if (Number.isNaN(dueAt)) continue;
@@ -1448,6 +1590,8 @@ function checkDueCourseReminders(): void {
 }
 
 function emitReminder(title: string, body: string): void {
+  // Android owns OS delivery even while the WebView is suspended.
+  if (window.youxuebanRuntime?.syncReminders) return;
   if (preferences.value.soundNotifications) playReminderSound();
   if (!preferences.value.browserNotifications) return;
   if (window.youxuebanRuntime?.notify) {
@@ -1491,6 +1635,11 @@ function playReminderSound(): void {
 
 async function handleBrowserNotificationsChange(): Promise<void> {
   if (!preferences.value.browserNotifications) return;
+  if (window.youxuebanRuntime?.requestReminderPermissions) {
+    window.youxuebanRuntime.requestReminderPermissions();
+    syncNativeReminders();
+    return;
+  }
   if (window.youxuebanRuntime?.notify) {
     showToast("系统通知提醒已开启");
     return;
@@ -1526,6 +1675,7 @@ function isQuietTime(date: Date): boolean {
 }
 
 function toggleTask(task: StudyTask): void {
+  if (task.homework) return;
   clearTaskDeleteConfirmation();
   task.status = task.status === "todo" ? "done" : "todo";
   showToast(task.status === "done" ? TEXTS.tasks.completed : TEXTS.tasks.restored);
@@ -1548,6 +1698,7 @@ function handleAppClick(event: MouseEvent): void {
 }
 
 function deleteTask(task: StudyTask): void {
+  if (!canDeleteTask(task)) return;
   if (deleteConfirmId.value !== task.id) {
     clearTaskDeleteConfirmation();
     deleteConfirmId.value = task.id;
@@ -1558,6 +1709,7 @@ function deleteTask(task: StudyTask): void {
     return;
   }
   tasks.value = tasks.value.filter((item) => item.id !== task.id);
+  if (selectedHomeworkId.value === task.id) selectedHomeworkId.value = null;
   clearTaskDeleteConfirmation();
   showToast(TEXTS.tasks.deleted);
 }
@@ -2091,33 +2243,56 @@ async function selectAssistantFiles(event: Event): Promise<void> {
   const input = event.target as HTMLInputElement;
   const files = [...(input.files ?? [])];
   input.value = "";
+  if (assistantFilesBusy.value) return;
+  assistantFilesBusy.value = true;
+  const conversationId = activeConversationId.value;
   const allowed = assistantRuntime.value?.allowedFileTypes ?? [];
+  try {
   for (const file of files) {
     if (assistantAttachments.value.length >= MAX_ASSISTANT_ATTACHMENTS) {
       showToast(`每条消息最多上传 ${MAX_ASSISTANT_ATTACHMENTS} 张图片`);
       break;
     }
-    if (!allowed.includes(file.type)) {
+    const mime = file.type || ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp" } as Record<string, string>)[file.name.split(".").pop()?.toLowerCase() ?? ""];
+    if (!mime || !allowed.includes(mime)) {
       showToast(TEXTS.validation.imageType);
       continue;
     }
-    if (file.size > MAX_ASSISTANT_FILE_SIZE) {
-      showToast(TEXTS.validation.imageTooLarge);
+    if (file.size > 20_000_000) {
+      showToast("单张原始图片不能超过 20 MB");
       continue;
     }
-    const dataUrl = await fileToDataUrl(file);
-    if (!isImageDataUrl(dataUrl)) {
+    try {
+      const image = await createImageBitmap(file);
+      let dataUrl: string;
+      try {
+        const scale = Math.min(1, 2048 / Math.max(image.width, image.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("无法读取图片");
+        context.fillStyle = "#fff";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        dataUrl = canvas.toDataURL("image/jpeg", .9);
+        for (const quality of [.8, .65, .5]) {
+          if (atob(dataUrl.split(",")[1]!).length <= MAX_ASSISTANT_FILE_SIZE) break;
+          dataUrl = canvas.toDataURL("image/jpeg", quality);
+        }
+      } finally { image.close(); }
+      const size = atob(dataUrl.split(",")[1]!).length;
+      if (size > MAX_ASSISTANT_FILE_SIZE) { showToast("图片压缩后仍过大，请裁剪后重试"); continue; }
+      if (activeConversationId.value !== conversationId) break;
+      assistantAttachments.value.push({
+        id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        name: file.name, mimeType: "image/jpeg", size, dataUrl,
+      });
+    } catch {
       showToast(TEXTS.validation.imageReadFailed);
-      continue;
     }
-    assistantAttachments.value.push({
-      id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      name: file.name,
-      mimeType: file.type as AssistantAttachment["mimeType"],
-      size: file.size,
-      dataUrl,
-    });
   }
+  } finally { assistantFilesBusy.value = false; }
 }
 
 function removeAssistantAttachment(id: string): void {
@@ -2145,7 +2320,7 @@ async function sendAssistant(prompt = assistantInput.value): Promise<void> {
     return;
   }
   const text = prompt.trim();
-  if ((!text && !assistantAttachments.value.length) || assistantBusy.value) return;
+  if ((!text && !assistantAttachments.value.length) || assistantBusy.value || assistantFilesBusy.value) return;
   const attachments = assistantAttachments.value.map((item) => ({ ...item }));
   const conversation = activeConversation.value;
   const addedTokens = estimateAssistantMessageTokens(text || "请分析这张图片", attachments);
@@ -2323,11 +2498,11 @@ async function executeAssistantTool(name: string, args: Record<string, unknown>)
     }
     if (name === "ddl_list") {
       const status = String(args.status ?? "todo");
-      const rows = tasks.value.filter((task) => status === "all" || task.status === status);
+      const rows = accountTasks.value.filter((task) => status === "all" || task.status === status);
       return { success: true, items: rows.map((task) => ({ ...task })) };
     }
     if (name === "ddl_show") {
-      const task = tasks.value.find((item) => item.id === Number(args.ddl_id));
+      const task = accountTasks.value.find((item) => item.id === Number(args.ddl_id));
       return task ? { success: true, ddl: { ...task } } : { success: false, error: "DDL 不存在" };
     }
     if (name === "ddl_add") {
@@ -2344,8 +2519,9 @@ async function executeAssistantTool(name: string, args: Record<string, unknown>)
       return { success: true, ddl: { ...task } };
     }
     if (name === "ddl_edit") {
-      const task = tasks.value.find((item) => item.id === Number(args.ddl_id) && item.status === "todo");
+      const task = accountTasks.value.find((item) => item.id === Number(args.ddl_id) && item.status === "todo");
       if (!task) return { success: false, error: "DDL 不存在或已完成" };
+      if (task.homework) return { success: false, error: "教学云作业内容与状态只能由系统同步" };
       if (args.content != null && !String(args.content).trim()) return { success: false, error: "DDL 内容不能为空" };
       if (args.deadline != null) {
         const dueAt = parseAssistantDeadline(String(args.deadline));
@@ -2359,22 +2535,26 @@ async function executeAssistantTool(name: string, args: Record<string, unknown>)
       return { success: true, ddl: { ...task } };
     }
     if (name === "ddl_remind") {
-      const task = tasks.value.find((item) => item.id === Number(args.ddl_id) && item.status === "todo");
+      const task = accountTasks.value.find((item) => item.id === Number(args.ddl_id) && item.status === "todo");
       if (!task) return { success: false, error: "DDL 不存在或已完成" };
+      if (task.homework) return { success: false, error: "教学云作业由系统同步" };
       task.reminderMinutes = args.reminder_minutes == null ? null : Math.max(0, Math.min(10080, Number(args.reminder_minutes)));
       if (args.remind_during_quiet !== undefined) task.remindDuringQuiet = args.remind_during_quiet === true;
       return { success: true, ddl: { ...task } };
     }
     if (name === "ddl_done") {
-      const task = tasks.value.find((item) => item.id === Number(args.ddl_id));
+      const task = accountTasks.value.find((item) => item.id === Number(args.ddl_id));
       if (!task) return { success: false, error: "DDL 不存在" };
+      if (task.homework) return { success: false, error: "教学云作业只能由系统标为已提交" };
       task.status = "done";
       return { success: true, ddl: { ...task } };
     }
     if (name === "ddl_delete") {
       const id = Number(args.ddl_id);
+      if (!accountTasks.value.some(task => task.id === id)) return { success: false, error: "DDL 不存在" };
       const index = tasks.value.findIndex((item) => item.id === id);
       if (index < 0) return { success: false, error: "DDL 不存在" };
+      if (!canDeleteTask(tasks.value[index]!)) return { success: false, error: "待完成的教学云作业不能删除" };
       tasks.value.splice(index, 1);
       return { success: true, ddl_id: id };
     }
@@ -2518,7 +2698,7 @@ function runAssistantAction(message: AssistantMessage): void {
                 <div class="surface-heading"><h2>近期任务</h2><button class="text-button" type="button" @click="navigate('tasks')">查看全部 <IconGlyph name="arrow-right" :size="15" /></button></div>
                 <div class="compact-task-list">
                   <div v-for="task in todoTasks.slice(0, 4)" :key="task.id" class="compact-task">
-                    <button class="task-check" type="button" :aria-label="`完成 ${task.title}`" @click="toggleTask(task)"><IconGlyph name="check" :size="14" /></button>
+                    <button class="task-check" type="button" :disabled="Boolean(task.homework)" :aria-label="task.homework ? '作业状态由教学云同步' : `完成 ${task.title}`" @click="toggleTask(task)"><IconGlyph :name="task.homework ? 'book' : 'check'" :size="14" /></button>
                     <button class="task-summary" type="button" @click="navigate('tasks')"><strong>{{ task.title }}</strong><small>{{ task.course }} · {{ formatReminder(task.reminderMinutes) }}</small></button>
                     <time :class="{ overdue: new Date(task.dueAt).getTime() < Date.now() }">{{ relativeDue(task.dueAt) }}</time>
                   </div>
@@ -2539,27 +2719,32 @@ function runAssistantAction(message: AssistantMessage): void {
 
         <section v-else-if="currentPage === 'tasks'" class="page">
           <header class="page-heading split"><div><span class="eyebrow">个人事务</span><h1>任务与 DDL</h1><p>{{ TEXTS.pages.tasksDescription }}</p></div><button class="primary-button" type="button" @click="openTaskModal()"><IconGlyph name="plus" />添加任务</button></header>
-          <div class="toolbar"><div class="segmented"><button v-for="filter in [{id:'todo',label:`待完成 ${todoTasks.length}`},{id:'all',label:`全部 ${tasks.length}`},{id:'done',label:`已完成 ${tasks.filter(t=>t.status==='done').length}`} ]" :key="filter.id" type="button" :class="{ active: taskFilter === filter.id }" @click="taskFilter = filter.id as typeof taskFilter">{{ filter.label }}</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="taskSearch" placeholder="搜索任务或课程" /></label></div>
+          <div class="homework-sync-bar">
+            <span role="status">{{ homeworkBusy ? '正在同步教学云作业' : homeworkError || (homeworkUpdatedAt ? `作业已同步 · ${formatDateTime(homeworkUpdatedAt)}` : '教学云作业尚未同步') }}</span>
+            <button v-if="homeworkBusy" class="icon-button" type="button" aria-label="取消作业同步" title="取消作业同步" @click="cancelHomeworkSync"><IconGlyph name="close" /></button>
+            <button v-else class="secondary-button" type="button" @click="syncHomework(true)"><IconGlyph name="refresh" />同步作业</button>
+          </div>
+          <div v-if="homeworkCourse" class="homework-course-filter"><strong>{{ homeworkCourse }}</strong><span>全部作业</span><button class="icon-button" type="button" aria-label="清除课程筛选" title="清除课程筛选" @click="homeworkCourse = ''"><IconGlyph name="close" /></button></div>
+          <div class="toolbar"><div class="segmented task-filters"><button v-for="filter in [{id:'todo',label:`待完成 ${todoTasks.length}`},{id:'all',label:`全部 ${accountTasks.length}`},{id:'done',label:`已完成 ${accountTasks.filter(t=>t.status==='done').length}`},{id:'submitted',label:`已提交 ${accountTasks.filter(t=>t.status==='submitted').length}`} ]" :key="filter.id" type="button" :class="{ active: taskFilter === filter.id }" @click="taskFilter = filter.id as typeof taskFilter">{{ filter.label }}</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="taskSearch" placeholder="搜索任务或课程" /></label></div>
           <div class="task-list surface">
-            <article v-for="task in filteredTasks" :key="task.id" class="task-row" :class="{ completed: task.status === 'done' }">
-              <button class="task-check" :class="{ checked: task.status === 'done' }" type="button" :aria-label="task.status === 'done' ? '恢复任务' : '完成任务'" @click="toggleTask(task)"><IconGlyph name="check" :size="14" /></button>
-              <div class="task-body"><strong>{{ task.title }}</strong><span><b>{{ task.course }}</b><span class="dot-separator">·</span><IconGlyph name="bell" :size="13" /> {{ formatReminder(task.reminderMinutes) }}<template v-if="task.remindDuringQuiet"><span class="dot-separator">·</span>静默时段仍提醒</template></span></div>
-              <div class="task-due"><span :class="{ overdue: new Date(task.dueAt).getTime() < Date.now() && task.status === 'todo' }">{{ formatDateTime(task.dueAt) }}</span><small>{{ task.status === 'done' ? '已完成' : relativeDue(task.dueAt) }}</small></div>
-              <button v-if="task.status === 'todo'" class="row-action" type="button" aria-label="编辑任务" @click="openTaskEdit(task)"><IconGlyph name="edit" /></button><button class="row-action danger" :class="{ confirming: deleteConfirmId === task.id }" type="button" :aria-label="deleteConfirmId === task.id ? '确认删除任务' : '删除任务'" @click="deleteTask(task)"><span v-if="deleteConfirmId === task.id">{{ TEXTS.tasks.confirmDelete }}</span><IconGlyph v-else name="trash" /></button>
+            <article v-for="task in filteredTasks" :key="task.id" class="task-row" :class="{ completed: task.status !== 'todo', 'homework-row': task.homework }">
+              <button class="task-check" :class="{ checked: task.status !== 'todo' }" type="button" :disabled="Boolean(task.homework)" :aria-label="task.homework ? '作业状态由教学云同步' : task.status === 'done' ? '恢复任务' : '完成任务'" @click="toggleTask(task)"><IconGlyph :name="task.homework && task.status === 'todo' ? 'book' : 'check'" :size="14" /></button>
+              <div class="task-body"><button v-if="task.homework" class="homework-title" type="button" @click="selectedHomeworkId = task.id">{{ task.title }}</button><strong v-else>{{ task.title }}</strong><span><b>{{ task.course }}</b><span class="dot-separator">·</span><IconGlyph name="bell" :size="13" /> {{ formatReminder(task.reminderMinutes) }}<template v-if="task.remindDuringQuiet"><span class="dot-separator">·</span>静默时段仍提醒</template></span></div>
+              <div class="task-due"><span :class="{ overdue: new Date(task.dueAt).getTime() < Date.now() && task.status === 'todo' }">{{ formatDateTime(task.dueAt) }}</span><small>{{ task.status === 'submitted' ? '已提交' : task.status === 'done' ? '已完成' : relativeDue(task.dueAt) }}</small></div>
+              <button v-if="task.status === 'todo' && !task.homework" class="row-action" type="button" aria-label="编辑任务" @click="openTaskEdit(task)"><IconGlyph name="edit" /></button><button v-if="task.homework" class="row-action" type="button" aria-label="查看作业详情" title="查看作业详情" @click="selectedHomeworkId = task.id"><IconGlyph name="book" /></button><button v-if="canDeleteTask(task)" class="row-action danger" :class="{ confirming: deleteConfirmId === task.id }" type="button" :aria-label="deleteConfirmId === task.id ? '确认删除任务' : '删除任务'" @click="deleteTask(task)"><span v-if="deleteConfirmId === task.id">{{ TEXTS.tasks.confirmDelete }}</span><IconGlyph v-else name="trash" /></button>
             </article>
             <div v-if="!filteredTasks.length" class="empty-state"><IconGlyph name="search" :size="28" /><strong>没有找到任务</strong><span>换个关键词，或新建一项任务</span></div>
           </div>
         </section>
 
-        <section v-else-if="currentPage === 'courses'" class="page">
-          <header class="page-heading split"><div><span class="eyebrow">当前是第 {{ currentAcademicWeek }} 周</span><h1>第 <input class="week-number-input" type="text" inputmode="numeric" pattern="[0-9]*" :value="selectedWeek" aria-label="查看第几周课程" @blur="updateSelectedWeek" @keydown.enter.prevent="finishSelectedWeekInput" /> 周课程</h1><p>点击课程查看周次、地点、教师和提醒设置</p></div><button class="primary-button" type="button" @click="openImport"><IconGlyph name="upload" />导入课表</button></header>
-          <div class="toolbar course-toolbar"><div class="week-switcher"><button class="icon-button" type="button" aria-label="上一周" :disabled="selectedWeek <= 1" @click="changeWeek(-1)"><IconGlyph name="chevron-left" /></button><button class="secondary-button active week-current-button" type="button" @click="goToCurrentWeek">{{ selectedWeek === currentAcademicWeek ? '本周' : `返回第 ${currentAcademicWeek} 周` }}</button><button class="icon-button" type="button" aria-label="下一周" :disabled="selectedWeek >= MAX_ACADEMIC_WEEK" @click="changeWeek(1)"><IconGlyph name="chevron-right" /></button></div><span class="sync-status"><span class="status-dot" />第 {{ selectedWeek }} 周</span></div>
+        <section v-else-if="currentPage === 'courses'" class="page courses-page">
+          <header class="page-heading course-heading"><div class="week-switcher"><button class="icon-button" type="button" aria-label="上一周" :disabled="selectedWeek <= 1" @click="changeWeek(-1)"><IconGlyph name="chevron-left" /></button><h1>第 <input class="week-number-input" type="text" inputmode="numeric" pattern="[0-9]*" :value="selectedWeek" aria-label="查看第几周课程" @blur="updateSelectedWeek" @keydown.enter.prevent="finishSelectedWeekInput" /> 周课程</h1><button class="icon-button" type="button" aria-label="下一周" :disabled="selectedWeek >= MAX_ACADEMIC_WEEK" @click="changeWeek(1)"><IconGlyph name="chevron-right" /></button></div><div class="course-heading-actions"><button class="icon-button" type="button" aria-label="添加课程" title="添加课程" @click="openCourseAdd()"><IconGlyph name="plus" /></button><button class="primary-button course-import-button" type="button" aria-label="导入课表" title="导入课表" @click="openImport"><IconGlyph name="upload" /></button></div></header>
           <div class="schedule-wrap surface">
-            <div class="schedule-grid">
-              <div class="schedule-corner" :style="{ gridColumn: '1', gridRow: '1' }" /><div v-for="(day, dayIndex) in weekDates" :key="day.label" class="day-header" :style="{ gridColumn: String(dayIndex + 2), gridRow: '1' }"><strong>{{ day.label }}</strong><span>{{ formatWeekDate(day.date) }}</span></div>
+            <div class="schedule-grid" :style="{ '--schedule-days': compactSchedule.days, '--schedule-rows': compactSchedule.rows }">
+              <div class="schedule-corner" :style="{ gridColumn: '1', gridRow: '1' }" /><div v-for="(day, dayIndex) in weekDates" :key="day.label" class="day-header" :class="{ 'mobile-hidden': dayIndex >= compactSchedule.days }" :style="{ gridColumn: String(dayIndex + 2), gridRow: '1' }"><strong>{{ day.label }}</strong><span>{{ formatWeekDate(day.date) }}</span></div>
               <template v-for="row in sectionRows" :key="row.key">
-                <div class="section-label" :style="{ gridColumn: '1', gridRow: String(row.key + 1) }"><strong>{{ row.label }}</strong><span>{{ row.startTime }}</span><span>{{ row.endTime }}</span></div>
-                <button v-for="day in 7" :key="`${row.key}-${day}`" class="schedule-slot" :class="{ selected: pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key }" :style="{ gridColumn: String(day + 1), gridRow: String(row.key + 1) }" type="button" :aria-label="`${weekdays[day - 1]}第${row.key}节空白课程区域`" @click="handleScheduleSlotClick(day, row.key)"><IconGlyph v-if="pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key" name="plus" :size="18" /></button>
+                <div class="section-label" :class="{ 'mobile-hidden': row.key > compactSchedule.lastSection, 'empty-section': !compactSchedule.occupied[row.key - 1] }" :style="{ gridColumn: '1', gridRow: String(row.key + 1) }"><strong>{{ row.label }}</strong><span>{{ row.startTime }}</span><span>{{ row.endTime }}</span></div>
+                <button v-for="day in 7" :key="`${row.key}-${day}`" class="schedule-slot" :class="{ 'mobile-hidden': day > compactSchedule.days || row.key > compactSchedule.lastSection, selected: pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key }" :style="{ gridColumn: String(day + 1), gridRow: String(row.key + 1) }" type="button" :aria-label="`${weekdays[day - 1]}第${row.key}节空白课程区域`" @click="handleScheduleSlotClick(day, row.key)"><IconGlyph v-if="pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key" name="plus" :size="18" /></button>
               </template>
               <button v-for="course in visibleCourses" :key="course.id" class="course-cell" :class="[`course-${course.color}`, { compact: course.endSection === course.startSection }]" :style="courseGridPosition(course)" type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><span>{{ course.location }}</span><small>{{ course.teacher }}</small></button>
             </div>
@@ -2641,7 +2826,7 @@ function runAssistantAction(message: AssistantMessage): void {
           <article class="settings-section surface profile-settings"><div><h2>个人资料</h2><p>昵称会用于问候；头像可从本地上传，图片只保存在当前设备</p></div><div class="profile-editor"><span class="avatar avatar-preview"><img v-if="profileDraftAvatar" :src="profileDraftAvatar" alt="头像预览" /><template v-else>{{ profileDraftName.trim().slice(0, 1) || '邮' }}</template></span><div class="profile-fields"><label>昵称<input v-model="profileDraftName" maxlength="20" placeholder="该怎么称呼你" @input="profileEditError = ''" /></label><div class="avatar-upload-actions"><label class="secondary-button file-button"><IconGlyph name="upload" :size="16" />上传头像<input type="file" accept="image/png,image/jpeg,image/webp" @change="selectAvatarFile" /></label><button v-if="profileDraftAvatar" class="text-button" type="button" @click="clearAvatarDraft">移除头像</button><small>PNG、JPG 或 WebP，不超过 2 MB</small></div><p v-if="profileEditError" class="inline-error" role="alert">{{ profileEditError }}</p></div><button class="secondary-button" type="button" @click="saveProfile">保存资料</button></div></article>
           <article class="settings-section surface appearance-settings"><div><h2>外观与动效</h2><p>选择显示模式，并按需要降低界面动态效果</p></div><div class="appearance-controls"><div class="segmented"><button v-for="option in [{id:'system',label:'跟随系统'},{id:'light',label:'浅色'},{id:'dark',label:'深色'}]" :key="option.id" type="button" :class="{ active: preferences.theme === option.id }" @click="preferences.theme = option.id as Preferences['theme']">{{ option.label }}</button></div><label class="switch-row motion-setting"><span><strong>减少动画效果</strong><small>关闭菜单滑动和页面淡入淡出，适合对动态效果敏感时使用</small></span><input v-model="preferences.reduceMotion" type="checkbox" role="switch" aria-label="减少动画效果" /></label></div></article>
           <article class="settings-section surface"><div><h2>默认提醒</h2><p>{{ TEXTS.pages.reminderDescription }}</p></div><label>任务提前<div class="reminder-control"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="defaultTaskReminderValue" @input="updateDefaultTaskReminderInput" @blur="restoreDefaultTaskReminderInput" /><select :value="defaultTaskReminderUnit" aria-label="任务提醒单位" @change="changeDefaultTaskReminderUnit"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="courseReminderValue" @input="updateCourseReminderInput" @blur="restoreCourseReminderInput" /><span>分钟</span></div></label></article>
-          <article class="settings-section surface notification-settings"><div><h2>通知设置</h2><p>声音和系统通知可以分别控制</p></div><div class="notification-controls"><label class="switch-row"><span><strong>播放声音</strong><small>提醒触发时播放提示音</small></span><input v-model="preferences.soundNotifications" type="checkbox" role="switch" aria-label="播放声音" /></label><label class="switch-row"><span><strong>系统通知</strong><small>在应用运行时显示系统通知，需允许本机通知权限</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="系统通知" @change="handleBrowserNotificationsChange" /></label></div></article>
+          <article class="settings-section surface notification-settings"><div><h2>通知设置</h2><p>声音和系统通知可以分别控制</p></div><div class="notification-controls"><label class="switch-row"><span><strong>播放声音</strong><small>提醒触发时播放提示音</small></span><input v-model="preferences.soundNotifications" type="checkbox" role="switch" aria-label="播放声音" /></label><label class="switch-row"><span><strong>系统通知</strong><small>需允许系统通知与后台运行权限</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="系统通知" @change="handleBrowserNotificationsChange" /></label><button v-if="isAndroidRuntime" class="secondary-button" type="button" @click="requestNativeReminderPermissions"><IconGlyph name="bell" />检查提醒权限</button></div></article>
           <article class="settings-section surface"><div><h2>学期课表</h2><p>第 1 周起始日，用于计算周次；周课表仍按周一至周日排列</p></div><label>第一周开始<input v-model="preferences.semesterStart" type="date" /></label></article>
           <article class="settings-section surface"><div><h2>静默时段</h2><p>{{ TEXTS.pages.quietHoursDescription }}</p></div><label>开始<input v-model="preferences.quietStart" type="time" /></label><label>结束<input v-model="preferences.quietEnd" type="time" /></label></article>
           <article class="settings-section surface privacy-settings"><div><h2>隐私</h2><p>控制助手如何使用你的数据</p></div><div class="switch-row"><span><strong>个性化记忆</strong><small>允许助手参考当前对话的历史消息与称呼</small></span><input v-model="preferences.memoryEnabled" type="checkbox" role="switch" aria-label="个性化记忆" /></div><div class="switch-row"><span><strong>学习数据分析</strong><small>允许助手分析本地课程、任务与学习节奏</small></span><input v-model="preferences.analyticsEnabled" type="checkbox" role="switch" aria-label="学习数据分析" /></div></article>
@@ -2654,6 +2839,15 @@ function runAssistantAction(message: AssistantMessage): void {
 
     <nav class="mobile-nav" aria-label="移动端主导航"><button v-for="item in mobileNavItems" :key="item.id" type="button" :class="{ active: currentPage === item.id }" :aria-current="currentPage === item.id ? 'page' : undefined" :title="item.label" @click="navigate(item.id)"><IconGlyph :name="item.icon" :size="18" /><span>{{ item.label }}</span></button></nav>
 
+    <div v-if="selectedHomework" class="modal-backdrop" @click.self="selectedHomeworkId = null">
+      <section class="modal homework-detail" role="dialog" aria-modal="true" aria-labelledby="homework-detail-title">
+        <header><div><span class="eyebrow">{{ selectedHomework.status === 'submitted' ? '已提交' : '待完成' }}</span><h2 id="homework-detail-title">{{ selectedHomework.title }}</h2></div><button class="icon-button" type="button" aria-label="关闭作业详情" @click="selectedHomeworkId = null"><IconGlyph name="close" /></button></header>
+        <p class="homework-deadline">截止时间：{{ formatDateTime(selectedHomework.dueAt) }}</p>
+        <div v-if="homeworkDetailHtml" class="homework-content" v-html="homeworkDetailHtml" />
+        <p v-else>此作业没有文字正文，请查看教学云原文及附件。</p>
+        <footer><a class="secondary-button" :href="selectedHomework.homework?.url" target="_blank" rel="noopener noreferrer"><IconGlyph name="external" />教学云原文</a><button class="primary-button" type="button" @click="selectedHomeworkId = null">关闭</button></footer>
+      </section>
+    </div>
     <div v-if="taskModalOpen" class="modal-backdrop" @click.self="taskModalOpen = false">
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header><div><span class="eyebrow">{{ editingTaskId === null ? '新建' : '编辑' }}</span><h2 id="task-modal-title">{{ editingTaskId === null ? '添加任务' : '编辑任务' }}</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="taskModalOpen = false"><IconGlyph name="close" /></button></header><form @submit.prevent="createTask"><label>任务内容<input v-model="taskForm.title" autofocus placeholder="例如：完成软件工程需求分析" /></label><div class="form-grid"><label>课程或分类<input v-model="taskForm.course" placeholder="个人计划" /></label><label>截止时间<input v-model="taskForm.dueAt" type="datetime-local" /></label></div><label>提前提醒（分钟）<input v-model.number="taskForm.reminderMinutes" type="number" min="0" max="10080" step="1" placeholder="0 表示到点提醒" /></label><label class="switch-row modal-switch"><span><strong>静默时段仍提醒</strong><small>仅为确实不能错过的任务开启</small></span><input v-model="taskForm.remindDuringQuiet" type="checkbox" role="switch" /></label><footer><button class="secondary-button" type="button" @click="taskModalOpen = false">取消</button><button class="primary-button" type="submit">{{ editingTaskId === null ? '添加任务' : '保存修改' }}</button></footer></form></section>
     </div>
@@ -2681,6 +2875,7 @@ function runAssistantAction(message: AssistantMessage): void {
     <div v-if="selectedCourse" class="drawer-backdrop" @click.self="selectedCourse = null">
       <aside class="drawer" role="dialog" aria-modal="true" aria-label="课程详情">
         <header><span class="course-detail-mark" :class="`course-${selectedCourse.color}`" /><button class="icon-button" type="button" aria-label="关闭" @click="selectedCourse = null"><IconGlyph name="close" /></button></header>
+        <button v-if="!courseEditing" class="secondary-button full" type="button" @click="viewCourseHomework"><IconGlyph name="tasks" />查看作业</button>
         <template v-if="!courseEditing"><span class="eyebrow">{{ weekdays[selectedCourse.weekday - 1] ?? `周${selectedCourse.weekday}` }} · 第 {{ selectedCourse.startSection }}–{{ selectedCourse.endSection }} 节</span><h2>{{ selectedCourse.name }}</h2><div class="detail-list"><div><IconGlyph name="clock" /><span><small>上课时间</small><strong>{{ selectedCourse.startTime }}–{{ selectedCourse.endTime }}</strong></span></div><div><IconGlyph name="map" /><span><small>地点</small><strong>{{ selectedCourse.location }}</strong></span></div><div><IconGlyph name="book" /><span><small>教师与周次</small><strong>{{ selectedCourse.teacher }} · {{ selectedCourse.weeks }}</strong></span></div><div><IconGlyph name="bell" /><span><small>提醒</small><strong>{{ formatReminder(selectedCourse.reminderMinutes) }}</strong></span></div></div><button class="primary-button full" type="button" @click="startCourseEdit">编辑课程</button><button class="danger-button course-delete-button" :class="{ confirming: courseDeleteConfirming }" type="button" @click="deleteSelectedCourse">{{ courseDeleteConfirming ? '确认删除课程' : '删除课程' }}</button></template>
         <form v-else class="course-edit-form" @submit.prevent="saveCourse"><span class="eyebrow">编辑课程</span><label>课程名<input v-model="courseForm.name" autofocus /></label><div class="form-grid"><label>教师<input v-model="courseForm.teacher" /></label><label>地点<input v-model="courseForm.location" /></label></div><div class="form-grid"><label>星期<select v-model.number="courseForm.weekday"><option v-for="(day,index) in weekdayOptions" :key="day" :value="index + 1">{{ day }}</option></select></label><label>周次<input v-model="courseForm.weeks" placeholder="1-2，4-10" inputmode="numeric" /></label></div><div class="form-grid"><label>开始节次<input v-model.number="courseForm.startSection" type="number" min="1" max="20" /></label><label>结束节次<input v-model.number="courseForm.endSection" type="number" min="1" max="20" /></label></div><label>提前提醒（分钟）<input v-model.number="courseForm.reminderMinutes" type="number" min="0" max="10080" step="1" /></label><footer><button class="secondary-button" type="button" @click="courseEditing = false; courseDeleteConfirming = false">取消</button><button class="primary-button" type="submit">保存修改</button></footer></form>
       </aside>

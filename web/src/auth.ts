@@ -5,9 +5,13 @@ export interface LocalRuntimeResult {
 
 declare global {
   interface Window {
+    __androidBack?: () => boolean;
     youxuebanRuntime?: {
       request(route: string, init?: { method?: string; body?: string }, signal?: AbortSignal): Promise<LocalRuntimeResult>;
       notify?(title: string, body: string): Promise<boolean>;
+      setTheme?(dark: boolean): void;
+      syncReminders?(items: Array<{ id: string; at: number; title: string; body: string; silent?: boolean }>): boolean;
+      requestReminderPermissions?(): void;
     };
   }
 }

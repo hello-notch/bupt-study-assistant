@@ -41,7 +41,7 @@ async function main() {
         notify: async () => true,
         request: async route => ({ status: 200, body: route === "/api/local/settings/status"
           ? { campus: { configured: true }, ai: { configured: true, model: "deepseek-chat" } }
-          : route === "/api/config" ? { assistant: { model: "deepseek-chat", contextWindow: 128000, thinkingSupported: true } }
+          : route === "/api/config" ? { assistant: { model: "deepseek-flash", contextWindow: 128000, thinkingSupported: true, allowedFileTypes: ["image/png", "image/jpeg", "image/webp"] } }
           : route === "/api/assistant/models" ? { models: ["deepseek-chat"] }
           : { items: [], statuses: [], errors: [] } }),
       };
@@ -78,7 +78,7 @@ async function main() {
     assert.ok(!(await page.locator(".notification-settings").innerText()).includes("Windows"));
     await page.getByLabel("昵称", { exact: true }).fill("保存验证");
     await page.getByRole("button", { name: "保存资料", exact: true }).click();
-    assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("youxueban-state-v9")).profileName), "保存验证");
+    assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("youxueban-state-v10")).profileName), "保存验证");
     await page.screenshot({ path: path.join(output, "settings.png") });
     assert.ok(await page.locator(".danger-zone > .danger-button").evaluateAll(buttons =>
       buttons.every(button => getComputedStyle(button).justifySelf === "end")));
@@ -98,6 +98,41 @@ async function main() {
     assert.equal((await prompts.boundingBox()).height, promptBox.height);
     await noOverflow();
     await page.screenshot({ path: path.join(output, "assistant-long.png") });
+    assert.ok(await page.locator(".thinking-toggle").evaluate(el => {
+      const toggle = el.getBoundingClientRect(), send = document.querySelector(".composer-send").getBoundingClientRect();
+      return toggle.right <= send.left && Math.abs(toggle.y - send.y) < 1;
+    }));
+    await page.getByRole("button", { name: "新建对话", exact: true }).click();
+    const image = await page.evaluate(() => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 2400; canvas.height = 1600;
+      const context = canvas.getContext("2d");
+      context.fillStyle = "#fff"; context.fillRect(0, 0, 2400, 1600);
+      context.fillStyle = "#1769e0"; context.fillRect(100, 100, 1000, 1000);
+      return canvas.toDataURL("image/png").split(",")[1];
+    });
+    await page.locator(".assistant-composer input[type=file]").setInputFiles({
+      name: "regression.png", mimeType: "image/png", buffer: Buffer.from(image, "base64"),
+    });
+    await page.locator(".assistant-attachment-tray img").waitFor();
+    const attachment = await page.locator(".assistant-attachment-tray img").getAttribute("src");
+    assert.ok(attachment.startsWith("data:image/jpeg;base64,"));
+    assert.ok(Buffer.from(attachment.split(",")[1], "base64").length <= 1000000);
+    for (const width of [320, 390]) {
+      await page.setViewportSize({ width, height: 480 });
+      await page.locator(".assistant-composer textarea").fill("图片上传测试，请解释图片中的内容。".repeat(12));
+      assert.ok(await page.locator(".composer-send").evaluate(el => {
+        const rect = el.getBoundingClientRect();
+        const navTop = document.querySelector(".mobile-nav").getBoundingClientRect().top;
+        const target = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        return rect.bottom <= navTop && (target === el || el.contains(target));
+      }), "Keyboard-height viewport must keep Send above the navigation");
+      await page.screenshot({ path: path.join(output, `assistant-keyboard-${width}.png`) });
+    }
+    await page.locator(".assistant-composer textarea").fill("");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByRole("button", { name: "移除附件" }).click();
+    assert.equal(await page.locator(".assistant-attachment-tray").count(), 0);
     async function swipe(selector, dx, dy = 0, multi = false) {
       await page.locator(selector).evaluate((el, { dx, dy, multi }) => {
         const touch = (x, y, id = 1) => new Touch({ identifier: id, target: el, clientX: x, clientY: y });

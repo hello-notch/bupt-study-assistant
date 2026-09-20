@@ -23,10 +23,13 @@ async function authenticatePortalWithPlaywright(options) {
   if (!authentication) authentication = authenticatePortal(options).finally(() => { authentication = null; });
   return authentication;
 }
-async function authenticatePortal({ startUrl, account, password }) {
+async function authenticatePortal({ startUrl, account, password, forceRefresh = false }) {
   const window = new BrowserWindow();
   try {
-    await window.loadURL(startUrl);
+    // A live portal cookie does not imply the shared CAS session is still valid.
+    const loginUrl = new URL("https://auth.bupt.edu.cn/authserver/login");
+    loginUrl.searchParams.set("service", startUrl);
+    await window.loadURL(forceRefresh ? loginUrl.href : startUrl);
     let submitted = false;
     const deadline = Date.now() + 120_000;
     while (Date.now() < deadline) {

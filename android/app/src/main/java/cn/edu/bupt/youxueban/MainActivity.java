@@ -53,7 +53,7 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         WebView.setWebContentsDebuggingEnabled((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0);
         root = new FrameLayout(this);
-        root.setBackgroundColor(Color.WHITE);
+        root.setBackgroundColor(Color.rgb(238, 244, 250));
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             if (Build.VERSION.SDK_INT >= 30) {
                 android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
@@ -63,6 +63,8 @@ public final class MainActivity extends Activity {
             return insets;
         });
         setContentView(root);
+        if (Build.VERSION.SDK_INT >= 33) getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+            android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::handleBack);
         startup = new TextView(this);
         startup.setText("邮学伴正在启动…");
         startup.setTextSize(18);
@@ -79,6 +81,7 @@ public final class MainActivity extends Activity {
         }, 20_000);
         getSystemService(NotificationManager.class).createNotificationChannel(
             new NotificationChannel("reminders", "课程与任务提醒", NotificationManager.IMPORTANCE_DEFAULT));
+        ReminderReceiver.restore(this);
     }
 
     private WebView configuredWebView() {
@@ -217,6 +220,29 @@ public final class MainActivity extends Activity {
         catch (Exception ignored) { }
     }
     public final class UiBridge {
+        @JavascriptInterface public void setTheme(boolean dark) {
+            main.post(() -> {
+                int color = Color.parseColor(dark ? "#0b1018" : "#eef4fa");
+                root.setBackgroundColor(color);
+                getWindow().setStatusBarColor(color);
+                getWindow().setNavigationBarColor(color);
+                getWindow().setStatusBarContrastEnforced(false);
+                getWindow().setNavigationBarContrastEnforced(false);
+                getWindow().getInsetsController().setSystemBarsAppearance(
+                    dark ? 0 : WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
+                    WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+            });
+        }
+        @JavascriptInterface public boolean syncReminders(String json) {
+            return ReminderReceiver.replace(MainActivity.this, json);
+        }
+        @JavascriptInterface public void requestReminderPermissions() {
+            main.post(() -> {
+                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 41);
+                } else showExactAlarmPermission();
+            });
+        }
         @JavascriptInterface public void cancel(String id) {
             if (id.length() <= 32) eval(runtime, "window.__cancelRequest(" + JSONObject.quote(id) + ")");
         }
@@ -389,7 +415,7 @@ public final class MainActivity extends Activity {
             android.webkit.CookieManager cookies = android.webkit.CookieManager.getInstance();
             if (operation.equals("clearSessions")) {
                 for (String origin : origins) WebStorage.getInstance().deleteOrigin(origin);
-                for (String host : List.of("auth.bupt.edu.cn", "jwgl.bupt.edu.cn", "dekt.bupt.edu.cn", "my.bupt.edu.cn", "app.bupt.edu.cn")) {
+                for (String host : List.of("auth.bupt.edu.cn", "jwgl.bupt.edu.cn", "dekt.bupt.edu.cn", "my.bupt.edu.cn", "app.bupt.edu.cn", "ucloud.bupt.edu.cn", "apiucloud.bupt.edu.cn")) {
                     WebStorage.getInstance().deleteOrigin("https://" + host);
                     WebStorage.getInstance().deleteOrigin("http://" + host);
                 }
@@ -512,7 +538,7 @@ public final class MainActivity extends Activity {
                 if (headers != null) for (Iterator<String> keys = headers.keys(); keys.hasNext();) {
                     String key = keys.next();
                     if (List.of("host", "connection", "content-length").contains(key.toLowerCase(Locale.ROOT))) continue;
-                    if (!url.getHost().equals(initialHost) && (key.equalsIgnoreCase("cookie") || key.equalsIgnoreCase("authorization"))) continue;
+                    if (!url.getHost().equals(initialHost) && (key.equalsIgnoreCase("cookie") || key.equalsIgnoreCase("authorization") || key.equalsIgnoreCase("blade-auth") || key.equalsIgnoreCase("identity"))) continue;
                     connection.setRequestProperty(key, headers.getString(key));
                 }
                 if (campus && (headers == null || !headers.has("cookie") || !url.getHost().equals(initialHost))) {
@@ -528,6 +554,7 @@ public final class MainActivity extends Activity {
                     if ("set-cookie".equalsIgnoreCase(entry.getKey())) for (String cookie : entry.getValue())
                         android.webkit.CookieManager.getInstance().setCookie(address, cookie);
                 if (List.of(301, 302, 303, 307, 308).contains(status)) {
+                    if ("error".equals(args.optString("redirect"))) throw new Exception();
                     String location = connection.getHeaderField("Location");
                     if (location == null) throw new Exception();
                     String next = new URL(url, location).toString();
@@ -556,11 +583,38 @@ public final class MainActivity extends Activity {
         }
         throw new Exception();
     }
-    @Override public void onBackPressed() {
-        if (campusOverlay != null) { hideCampus(); return; }
-        if (ui != null && ui.canGoBack()) { ui.goBack(); return; }
-        super.onBackPressed();
+    private void showExactAlarmPermission() {
+        if (!getSystemService(NotificationManager.class).areNotificationsEnabled()) {
+            startActivity(new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName()));
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= 31 && !getSystemService(AlarmManager.class).canScheduleExactAlarms()) {
+            new AlertDialog.Builder(this).setTitle("准时提醒")
+                .setMessage("请允许邮学伴设置闹钟和提醒，否则后台提醒可能延迟。也请在手机电池设置中允许后台运行；强行停止应用会取消系统提醒。")
+                .setNegativeButton("稍后", null).setPositiveButton("去设置", (dialog, which) -> {
+                    try { startActivity(new Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                        Uri.parse("package:" + getPackageName()))); }
+                    catch (Exception ignored) { Toast.makeText(this, "请在系统设置中允许闹钟和提醒", Toast.LENGTH_LONG).show(); }
+                }).show();
+        } else Toast.makeText(this, "通知和准时提醒权限已开启", Toast.LENGTH_SHORT).show();
     }
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request == 41 && results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) showExactAlarmPermission();
+    }
+    @Override protected void onResume() {
+        super.onResume();
+        ReminderReceiver.restore(this);
+    }
+    private void handleBack() {
+        if (campusOverlay != null) { hideCampus(); return; }
+        if (ui == null) { moveTaskToBack(true); return; }
+        ui.evaluateJavascript("Boolean(window.__androidBack?.())", handled -> {
+            if (!"true".equals(handled)) moveTaskToBack(true);
+        });
+    }
+    @Override public void onBackPressed() { handleBack(); }
     @Override protected void onDestroy() {
         closed = true;
         if (fileCallback != null) fileCallback.onReceiveValue(null);

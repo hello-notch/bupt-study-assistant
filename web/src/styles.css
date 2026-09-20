@@ -111,6 +111,7 @@
 * { box-sizing: border-box; }
 html { min-width: 320px; min-height: 100%; overflow-anchor: none; background: var(--app-bg); scrollbar-width: none; }
 body { margin: 0; min-width: 320px; min-height: 100vh; overflow-anchor: none; background: radial-gradient(circle at 82% 4%, color-mix(in srgb, var(--blue) 9%, transparent), transparent 34rem), var(--app-bg); color: var(--text); font-size: 15px; scrollbar-width: none; }
+:root[data-platform="android"] body { background: var(--app-bg); }
 html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
 button, input, textarea, select { font: inherit; }
 button { color: inherit; }
@@ -278,6 +279,26 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .task-body > strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .task-body > span { display: flex; align-items: center; gap: 5px; margin-top: 5px; color: var(--text-secondary); font-size: 10px; }
 .task-body b { color: var(--blue-strong); font-weight: 600; }
+.homework-sync-bar, .homework-course-filter { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.homework-sync-bar > span { min-width: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.homework-sync-bar > button { flex-shrink: 0; }
+.homework-course-filter { justify-content: flex-start; padding-block: 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.homework-course-filter strong { overflow-wrap: anywhere; }
+.homework-course-filter .icon-button { flex-shrink: 0; margin-left: auto; }
+.homework-title { display: block; width: 100%; border: 0; padding: 0; background: none; text-align: left; color: var(--text); font-size: 13px; font-weight: 600; line-height: 1.6; overflow-wrap: anywhere; cursor: pointer; }
+.homework-title:hover { color: var(--blue-strong); }
+.homework-row .task-body > span { flex-wrap: wrap; }
+.homework-row { padding-block: 12px; }
+.homework-detail { width: min(720px, 100%); border-radius: 8px; }
+.homework-detail > header > div { min-width: 0; }
+.homework-detail h2 { font-size: 18px; line-height: 1.5; overflow-wrap: anywhere; }
+.homework-deadline { color: var(--text-secondary); font-size: 12px; }
+.homework-content { font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+.homework-content img { max-width: 100%; height: auto; }
+.homework-content table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+.homework-content td, .homework-content th { border: 1px solid var(--border); padding: 5px; }
+.homework-content pre { white-space: pre-wrap; }
+.homework-content h1, .homework-content h2, .homework-content h3 { font-size: 17px; }
 .dot-separator { color: var(--text-tertiary); }
 .task-due { text-align: right; }
 .task-due span, .task-due small { display: block; }
@@ -451,6 +472,11 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .assistant-composer .thinking-toggle { display: inline-flex; gap: 5px; padding: 0 10px; color: var(--text-secondary); background: var(--surface-soft); font-size: 9px; }
 .assistant-composer .thinking-toggle.active { color: var(--violet); background: var(--violet-soft); }
 .assistant-composer .composer-send { color: #fff; background: #1769e0; }
+.course-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.course-heading .week-switcher { gap: 2px; min-width: 0; }
+.course-heading h1 { margin: 0; font-size: 22px; white-space: nowrap; }
+.course-heading-actions { display: flex; align-items: center; gap: 6px; }
+.course-import-button { display: grid; place-items: center; width: 40px; height: 40px; padding: 0; gap: 0; }
 .assistant-composer button:disabled { opacity: .4; cursor: not-allowed; }
 .assistant-composer.blocked { border-color: color-mix(in srgb, var(--red) 48%, var(--border)); background: color-mix(in srgb, var(--red-soft) 40%, var(--surface)); }
 .assistant-note { flex: 0 0 auto; margin: 8px 4px 0; color: var(--text-tertiary); font-size: 9px; text-align: center; overflow-wrap: anywhere; }
@@ -777,15 +803,31 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .task-row { grid-template-columns: 24px minmax(0, 1fr) 32px 32px; gap: 8px; min-height: 84px; }
   .task-due { grid-column: 2; margin-top: -23px; text-align: left; }
   .task-due small { display: inline; margin-left: 7px; }
+  .task-filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; }
+  .task-filters button { padding-inline: 4px; font-size: 11px; white-space: normal; }
+  .homework-row .task-due { margin-top: 0; }
   .row-action { grid-column: 3; grid-row: 1 / span 2; opacity: 1; }
   .row-action.danger { grid-column: 4; }
   .row-action.confirming { position: absolute; right: 0; top: 50%; transform: translateY(-50%); }
+  .courses-page { height: 100dvh; display: flex; flex-direction: column; padding-top: 6px; padding-bottom: calc(66px + env(safe-area-inset-bottom)); }
+  .courses-page .course-heading h1 { font-size: 18px; }
+  .course-heading .icon-button { width: 32px; min-width: 32px; }
+  .courses-page > .page-heading { flex: 0 0 auto; margin-bottom: 10px; }
+  .courses-page > .page-heading p { display: none; }
+  .courses-page .course-toolbar { flex: 0 0 auto; flex-direction: row; align-items: center; margin-bottom: 8px; gap: 6px; }
+  .courses-page .schedule-wrap { flex: 1; min-height: 0; }
+  .courses-page .empty-state.compact { flex: 0 0 auto; min-height: 28px; padding: 4px 0; }
+  .courses-page .empty-state.compact strong { margin: 0; font-size: 11px; }
+  .courses-page .empty-state.compact span { display: none; }
   .schedule-wrap { display: block; padding: 6px 3px; border-radius: 8px; }
-  .schedule-grid { min-width: 0; grid-template-columns: 35px repeat(7, minmax(0, 1fr)); grid-template-rows: 42px repeat(14, 84px); gap: 3px; }
+  .schedule-grid { height: 100%; min-width: 0; grid-template-columns: 30px repeat(var(--schedule-days, 7), minmax(0, 1fr)); grid-template-rows: var(--schedule-rows); gap: 2px; }
+  .schedule-grid .mobile-hidden { display: none; }
+  .section-label { overflow: hidden; }
+  .section-label.empty-section span { display: none; }
   .schedule-slot { border-radius: 4px; }
-  .course-cell { padding: 5px 3px; border-left-width: 2px; border-radius: 5px; overflow-wrap: anywhere; }
-  .course-cell strong { font-size: 11px; line-height: 1.4; -webkit-line-clamp: 4; }
-  .course-cell span { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; font-size: 10px; line-height: 1.4; }
+  .course-cell { display: flex; flex-direction: column; padding: 3px 2px; border-left-width: 2px; border-radius: 5px; overflow-wrap: anywhere; }
+  .course-cell strong { flex: 0 1 auto; min-height: 0; font-size: 11px; line-height: 1.3; -webkit-line-clamp: 4; }
+  .course-cell span { flex: 0 1 auto; min-height: 0; display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: 9px; line-height: 1.3; margin-top: 3px; }
   .course-cell small { display: none; }
   .course-cell.compact { padding-block: 5px; }
   .course-cell.compact strong { -webkit-line-clamp: 3; }
@@ -807,9 +849,9 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .chat-panel { min-height: 0; padding: 16px 12px; }
   .message-content { max-width: 84%; }
   .assistant-composer textarea, .modal input, .modal select, .search-field input { font-size: 16px; }
-  .assistant-composer { grid-template-columns: auto minmax(0, 1fr) auto; }
-  .assistant-composer .thinking-toggle { grid-column: 2; justify-self: start; height: 30px; }
-  .assistant-composer .composer-send { grid-column: 3; grid-row: 1 / span 2; align-self: center; }
+  .assistant-composer { grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 5px; }
+  .assistant-composer .thinking-toggle { grid-column: 3; justify-content: center; padding: 0 7px; }
+  .assistant-composer .composer-send { grid-column: 4; align-self: end; }
   .settings-section { grid-template-columns: 1fr 1fr; gap: 15px; }
   .electricity-bind-card { grid-template-columns: 1fr; }
   .settings-section > div { grid-column: 1 / -1; }
@@ -847,6 +889,20 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .mobile-more-grid small { margin-top: 4px; color: var(--text-secondary); font-size: 9px; line-height: 1.4; }
   .mobile-more-grid > button > .icon-glyph { color: var(--text-tertiary); }
   .toast { bottom: 72px; max-width: calc(100% - 28px); white-space: nowrap; }
+}
+
+@media (max-width: 720px) and (max-height: 620px) {
+  .assistant-page { padding-top: 6px; }
+  .assistant-page > .page-heading { margin-bottom: 6px; }
+  .assistant-page > .page-heading > .eyebrow,
+  .assistant-page .assistant-runtime,
+  .assistant-page .quick-prompts,
+  .assistant-page .conversation-sidebar,
+  .assistant-page .assistant-note { display: none; }
+  .assistant-page .heading-with-action { flex-direction: row; align-items: center; gap: 8px; }
+  .assistant-page .heading-with-action h1 { font-size: 22px; }
+  .assistant-page .assistant-workspace { gap: 0; }
+  .assistant-page .assistant-composer textarea { max-height: 84px; overflow-y: auto !important; }
 }
 
 @media (max-width: 420px) {

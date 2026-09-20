@@ -1,5 +1,5 @@
 export type PageId = "today" | "tasks" | "courses" | "campus" | "electricity" | "assistant" | "notifications" | "settings";
-export type TaskStatus = "todo" | "done";
+export type TaskStatus = "todo" | "done" | "submitted";
 export type CampusKind = "notice" | "activity";
 
 export interface StudyTask {
@@ -11,6 +11,24 @@ export interface StudyTask {
   remindDuringQuiet: boolean;
   status: TaskStatus;
   createdAt: string;
+  homework?: HomeworkItem & { accountKey: string };
+}
+
+export interface HomeworkItem {
+  sourceId: string;
+  courseId: string;
+  course: string;
+  title: string;
+  contentHtml: string;
+  dueAt: string;
+  url: string;
+}
+
+export interface HomeworkSnapshot {
+  items: HomeworkItem[];
+  complete: true;
+  accountKey: string;
+  updatedAt: string;
 }
 
 export interface Course {

@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node ../scripts/start-client.cjs",
     "dev": "node ../scripts/start-client.cjs",
-    "test": "node --test local-runtime.test.cjs ../scripts/course-import.test.cjs",
+    "test": "node --test local-runtime.test.cjs ../scripts/course-import.test.cjs ../scripts/homework.test.cjs ../scripts/android-auth.test.cjs",
     "build:web": "pnpm --dir ../web run build",
     "dist:win": "pnpm run build:web && node build-win.cjs"
   },
@@ -31,6 +31,7 @@
     "files": [
       "main.cjs",
       "local-runtime.cjs",
+      "ucloud.cjs",
       "playwright-auth.cjs",
       "preload.cjs",
       "package.json",

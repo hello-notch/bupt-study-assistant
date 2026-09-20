@@ -1,5 +1,6 @@
 (() => {
   if (!window.AndroidUI) return;
+  document.documentElement.dataset.platform = "android";
   const pending = new Map();
   let sequence = 0;
   window.__androidReply = (id, result) => {
@@ -32,5 +33,8 @@
       });
     },
     notify: async (title, body) => AndroidUI.notify(String(title), String(body)),
+    setTheme: dark => AndroidUI.setTheme(Boolean(dark)),
+    syncReminders: items => AndroidUI.syncReminders(JSON.stringify(items)),
+    requestReminderPermissions: () => AndroidUI.requestReminderPermissions(),
   };
 })();
