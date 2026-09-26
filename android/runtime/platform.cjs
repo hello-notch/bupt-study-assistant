@@ -62,7 +62,8 @@ class BrowserWindow {
     signal?.addEventListener("abort", this.onAbort, { once: true });
   }
   loadURL(url) { return call("navigate", { window: this.id, url }, this.signal); }
-  show() { return call("showWindow", { window: this.id }); }
+  // Android campus authentication stays behind the UI, including automatic renewals.
+  show() { return Promise.resolve(); }
   isDestroyed() { return this.destroyed; }
   destroy() {
     if (this.destroyed) return;

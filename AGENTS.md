@@ -5,6 +5,8 @@
 ## 桌面模式更新（优先于下方历史说明）
 
 - 支持 Electron Windows 客户端和 Android 客户端；`web/` 为两端共享 UI 源码。Android 开发与真机验收遵循第 12 节，该节优先于下方仅适用于桌面的历史说明。
+- 如果用户没有明确指定修改桌面端，默认只修改 Android 端；共享代码只有在 Android 构建确实需要时才调整，并优先通过 Android 专用运行时或平台判断隔离行为。
+- Android 专属功能必须通过 Android 桥接或显式平台参数启用；不得将修改共享 Vue 页面或 Electron 运行时视为已完成 Android 验收，需重新构建 APK 并按第 12 节验证。
 - 已移除 `run-web.cmd`、`run-web.ps1`、`web/dev-api.ts`、`.env.example` 和 `config/ai_routes.toml`。下方涉及浏览器适配器的说明不再适用。
 - 首次执行 `pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir client install --frozen-lockfile`。
 - 根目录 `run-client.cmd` 调用 `scripts/start-client.cjs`，先类型检查和构建，再打开 Electron。没有网页服务器，不生成发布包；用户要求验收时保留桌面窗口。

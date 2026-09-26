@@ -51,7 +51,7 @@ function loginScript(account, password, submit) {
   })()`;
 }
 
-async function readSession(window, campus, interactive, forceLogin = false, staleToken = "") {
+async function readSession(window, campus, interactive, forceLogin = false, staleToken = "", readSessionScript = sessionScript) {
   // CAS/SPA navigations need not finish all subresources to become usable.
   // Android can also drop an evaluate callback when its document redirects.
   const navigate = url => { void window.loadURL(url).catch(() => {}); };
@@ -72,7 +72,7 @@ async function readSession(window, campus, interactive, forceLogin = false, stal
     if (window.isDestroyed()) throw new UcloudAuthError("教学云登录已取消");
     const host = new URL(window.webContents.getURL()).hostname;
     if (host === "ucloud.bupt.edu.cn") {
-      const value = await evaluate(sessionScript());
+      const value = await evaluate(readSessionScript());
       if (value && value.token !== staleToken) {
         if (value.account !== campus.ssoAccount) throw new UcloudAuthError("教学云登录账号与绑定账号不一致，请重新绑定校园账号");
         return value;
@@ -99,7 +99,7 @@ async function readSession(window, campus, interactive, forceLogin = false, stal
   throw new UcloudAuthError(interactive ? "教学云登录未完成，请在校内网重试并完成统一认证" : "教学云需要登录，请连接校内网后点击同步作业");
 }
 
-async function apiGet(path, auth, fetchImpl, signal) {
+async function apiGet(path, auth, fetchImpl, signal, init = {}) {
   const controller = new AbortController();
   const abort = () => controller.abort(signal.reason);
   const timer = setTimeout(() => controller.abort(new Error("教学云请求超时")), 25_000);
@@ -107,7 +107,9 @@ async function apiGet(path, auth, fetchImpl, signal) {
   if (signal?.aborted) abort();
   try {
     const response = await fetchImpl(`${UCLOUD_API}${path}`, {
+      ...init,
       headers: {
+        ...(init.body ? { "Content-Type": "application/json" } : {}),
         Authorization: "Basic c3dvcmQ6c3dvcmRfc2VjcmV0",
         "Tenant-Id": "000000",
         "Blade-Auth": auth.token,
@@ -177,8 +179,8 @@ function assignmentItem(row, detail, courseName) {
   };
 }
 
-async function fetchAssignments(auth, fetchImpl = fetch, signal) {
-  const get = path => apiGet(path, auth, fetchImpl, signal);
+async function fetchAssignments(auth, fetchImpl = fetch, signal, courseNameFallback) {
+  const get = (path, init) => apiGet(path, auth, fetchImpl, signal, init);
   const data = await get(`/ykt-site/site/student/undone?userId=${encodeURIComponent(auth.userId)}`);
   const rows = undoneRows(data);
   const courses = new Map();
@@ -188,26 +190,31 @@ async function fetchAssignments(auth, fetchImpl = fetch, signal) {
     const detail = await get(`/ykt-site/work/detail?assignmentId=${encodeURIComponent(row.activityId)}`);
     const siteId = detail.siteId || row.siteId;
     let name = detail.siteName || row.siteName;
-    if (!name && siteId) {
+    if (!name && siteId && (!courseNameFallback || Number(siteId) > 0)) {
       if (!courses.has(String(siteId))) {
         const site = await get(`/ykt-site/site/detail?id=${encodeURIComponent(siteId)}`);
         courses.set(String(siteId), site?.siteName);
       }
       name = courses.get(String(siteId));
     }
-    items.push(assignmentItem(row, detail, name));
+    let resolved;
+    if (!name && courseNameFallback) {
+      resolved = await courseNameFallback(detail, row, get, auth);
+      name = typeof resolved === "string" ? resolved : resolved?.name;
+    }
+    items.push(assignmentItem(row, resolved?.siteId ? { ...detail, siteId: resolved.siteId } : detail, name));
   }
   return items;
 }
 
-async function loadUcloudAssignments({ window, campus, interactive = false }) {
+async function loadUcloudAssignments({ window, campus, interactive = false, readSessionScript = sessionScript, courseNameFallback }) {
   try {
-    let auth = await readSession(window, campus, interactive);
-    try { return await fetchAssignments(auth, fetch, window.signal); }
+    let auth = await readSession(window, campus, interactive, false, "", readSessionScript);
+    try { return await fetchAssignments(auth, fetch, window.signal, courseNameFallback); }
     catch (error) {
       if (!(error instanceof UcloudAuthError) || !interactive) throw error;
-      auth = await readSession(window, campus, true, true, auth.token);
-      return await fetchAssignments(auth, fetch, window.signal);
+      auth = await readSession(window, campus, true, true, auth.token, readSessionScript);
+      return await fetchAssignments(auth, fetch, window.signal, courseNameFallback);
     }
   } finally { if (!window.isDestroyed()) window.destroy(); }
 }

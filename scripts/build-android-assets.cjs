@@ -29,6 +29,12 @@ async function main() {
         build.onResolve({ filter: /^node:(fs|path|crypto)$/ }, () => ({ path: path.join(runtime, "node-shims.cjs") }));
         build.onResolve({ filter: /^linkedom$/ }, () => ({ path: path.join(runtime, "dom.cjs") }));
         build.onResolve({ filter: /playwright-auth\.cjs$/ }, () => ({ path: path.join(runtime, "campus-auth.cjs") }));
+        build.onResolve({ filter: /ucloud\.cjs$/ }, args => {
+          if (args.importer === path.join(root, "client/local-runtime.cjs").replace(/\\/g, "/") ||
+              path.normalize(args.importer) === path.join(root, "client/local-runtime.cjs")) {
+            return { path: path.join(runtime, "ucloud.cjs") };
+          }
+        });
       },
     }],
   });

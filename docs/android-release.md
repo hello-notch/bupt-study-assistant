@@ -25,6 +25,8 @@ pnpm --dir client test
 pwsh -NoProfile -File ./scripts/build-android.ps1 -SdkRoot "<Android-SDK>" -JavaHome "<JDK>" -Gradle "<gradle.bat>" -Release
 node scripts/mobile-ui.test.cjs
 node scripts/homework-ui.test.cjs
+node --test scripts/android-tasks.test.cjs
+node scripts/android-tasks-ui.test.cjs
 ```
 
 构建会执行两项 TypeScript 检查、Vite 构建、Android 资源生成和 `assembleRelease`，
@@ -33,6 +35,10 @@ node scripts/homework-ui.test.cjs
 
 发布前核对 APK 的包名、版本、最低 Android 版本、签名与非 Debug 标志，并生成
 SHA-256 校验文件。最终 APK 的真机验收应另行记录，旧 Debug 包的验收不能替代。
+
+1.2.1 的任务回归还应覆盖旧状态迁移、日程开始提醒/待办截止提醒、补提醒去重、
+课程和日程的直接/缓冲冲突、重复加入活动、报名提醒修改/取消，以及应用关闭后原生通知送达。
+教学云同步必须通过真实页面确认作业已进入待办；仅接口返回条数不算页面验收。
 
 ## 安装与升级
 

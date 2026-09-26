@@ -6,6 +6,8 @@ import android.content.*;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import org.json.*;
+import java.util.HashSet;
+import java.util.Set;
 
 /** A persisted queue with one outstanding alarm, independent of either WebView. */
 public final class ReminderReceiver extends BroadcastReceiver {
@@ -25,12 +27,13 @@ public final class ReminderReceiver extends BroadcastReceiver {
             if (input.length() > 10000) return false;
             JSONArray queue = new JSONArray();
             long now = System.currentTimeMillis();
+            Set<String> delivered = context.getSharedPreferences(STORE, 0).getStringSet("delivered", Set.of());
             for (int i = 0; i < input.length(); i++) {
                 JSONObject item = input.getJSONObject(i);
                 long at = item.getLong("at");
                 if (item.getString("id").length() > 160 || item.getString("title").length() > 80 ||
                     item.getString("body").length() > 1000 || at <= 0 || at > 253402300799000L) return false;
-                if (at >= now) queue.put(item);
+                if (at >= now && !delivered.contains(item.getString("id"))) queue.put(item);
             }
             if (!context.getSharedPreferences(STORE, 0).edit().putString("queue", queue.toString()).commit()) return false;
             schedule(context, queue);
@@ -81,6 +84,10 @@ public final class ReminderReceiver extends BroadcastReceiver {
     }
 
     private static void deliver(Context context, JSONObject item) throws JSONException {
+        SharedPreferences store = context.getSharedPreferences(STORE, 0);
+        Set<String> delivered = new HashSet<>(store.getStringSet("delivered", Set.of()));
+        String id = item.getString("id");
+        if (delivered.contains(id)) return;
         if (Build.VERSION.SDK_INT >= 33 &&
             context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return;
         NotificationManager manager = context.getSystemService(NotificationManager.class);
@@ -94,7 +101,10 @@ public final class ReminderReceiver extends BroadcastReceiver {
             .setSmallIcon(android.R.drawable.ic_popup_reminder).setContentTitle(item.getString("title"))
             .setContentText(item.getString("body")).setStyle(new Notification.BigTextStyle().bigText(item.getString("body")))
             .setContentIntent(open).setAutoCancel(true).build();
-        manager.notify(item.getString("id"), 0, notification);
+        manager.notify(id, 0, notification);
+        if (delivered.size() >= 10000) delivered.remove(delivered.iterator().next());
+        delivered.add(id);
+        store.edit().putStringSet("delivered", delivered).commit();
     }
 
     @Override public void onReceive(Context context, Intent intent) {

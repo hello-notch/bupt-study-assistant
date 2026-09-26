@@ -22,7 +22,9 @@ const DEEPSEEK_MODELS = Object.freeze([
   "deepseek-v4-flash-vision-exp",
 ]);
 
-function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
+function createLocalRuntime({ app, BrowserWindow, safeStorage, session, android = false,
+  runCampusOperation = (_label, operation) => operation(1), getSignal = () => undefined, fetchImpl = (...args) => globalThis.fetch(...args) }) {
+  const fetch = fetchImpl;
   const settingsPath = () => path.join(app.getPath("userData"), "local-settings.bin");
   const campusCachePath = () => path.join(app.getPath("userData"), "campus-cache.json");
   const partitions = {
@@ -104,7 +106,8 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
       if (route === "/api/courses/mine" && method === "POST") return await ownSchedule();
       if (route === "/api/homework/sync" && method === "POST") {
         const campus = requireCampusSettings();
-        const items = await loadUcloudAssignments({ window: await createCampusWindow("ucloud"), campus, interactive: body.interactive === true });
+        const items = await runCampusOperation("教学云", async () =>
+          loadUcloudAssignments({ window: await createCampusWindow("ucloud"), campus, interactive: android || body.interactive === true }));
         // Discard a response from a login that was removed/changed while loading.
         if (readSettings().campus?.ssoAccount !== campus.ssoAccount) return bad(409, "校园账号已变更，请重新同步");
         return ok({ items, complete: true, accountKey: createHash("sha256").update(campus.ssoAccount).digest("hex"), updatedAt: new Date().toISOString() });
@@ -320,15 +323,15 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
     const statuses = [];
     const errors = [];
     try {
-      let cookies = await portalSessionCookies(campus);
-      let portalPages;
-      try {
-        portalPages = await fetchPortalPages(cookies);
-      } catch (error) {
-        if (!(error instanceof CampusBrowserSessionExpired)) throw error;
-        cookies = await portalSessionCookies(campus, true);
-        portalPages = await fetchPortalPages(cookies);
-      }
+      const portalPages = await runCampusOperation("信息门户", async attempt => {
+        let cookies = await portalSessionCookies(campus, attempt > 1);
+        try { return await fetchPortalPages(cookies); }
+        catch (error) {
+          if (!(error instanceof CampusBrowserSessionExpired)) throw error;
+          cookies = await portalSessionCookies(campus, true);
+          return await fetchPortalPages(cookies);
+        }
+      });
       const { portalNotices, homeResponse, homeHtml } = portalPages;
       const portalItems = [...portalNotices, ...parsePortalTodos(homeHtml, homeResponse.url)];
       items.push(...dedupeItems(portalItems));
@@ -342,7 +345,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
       statuses.push({ source: "portal", label: "信息门户", mode: cached.length ? "cache" : "error", message, itemCount: cached.length });
     }
     try {
-      const activity = await loadActivities(campus);
+      const activity = await runCampusOperation("第二课堂", () => loadActivities(campus));
       const previousActivities = new Map(readCampusCache().activity.map((item) => [item.id, item]));
       for (const item of activity) {
         const previous = previousActivities.get(item.id);
@@ -381,7 +384,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
   async function portalSessionCookies(campus, forceRefresh = false) {
     let cookies = Array.isArray(campus.portalCookies) ? campus.portalCookies : [];
     if (!forceRefresh && cookies.some((cookie) => !Number(cookie.expires) || Number(cookie.expires) < 0 || Number(cookie.expires) > Date.now() / 1000)) return cookies;
-    cookies = await authenticatePortalWithPlaywright({ startUrl: PORTAL_LIST_URL, account: campus.ssoAccount, password: campus.ssoPassword, forceRefresh });
+    cookies = await authenticatePortalWithPlaywright({ startUrl: PORTAL_LIST_URL, account: campus.ssoAccount, password: campus.ssoPassword, forceRefresh, signal: getSignal() });
     const value = readSettings();
     if (value.campus) {
       value.campus.portalCookies = cookies;
@@ -449,10 +452,10 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
     }
     if (token.split(".").length !== 3) throw new Error("登录需要验证码或账号密码不正确");
     try {
-      return await fetchActivityList(token);
+      return await fetchActivityList(token, fetch);
     } catch (error) {
       if (!(error instanceof CampusBrowserSessionExpired)) throw error;
-      return await fetchActivityList(await loginActivityInBrowser(campus, true));
+      return await fetchActivityList(await loginActivityInBrowser(campus, true), fetch);
     }
   }
 
@@ -488,7 +491,7 @@ function createLocalRuntime({ app, BrowserWindow, safeStorage, session }) {
         return true;
       })()`);
       if (!submitted) throw new Error("第二课堂登录页面结构已变化");
-      await window.show();
+      if (!android) await window.show();
       return await waitForPageValue(window, `(${activitySessionScript()}).token`, (value) => Boolean(value), 120_000, "第二课堂登录未完成，请在官方登录窗口完成验证码后重试");
     } finally {
       if (!window.isDestroyed()) window.destroy();
@@ -893,7 +896,7 @@ function activitySessionScript(forceRefresh = false) {
   })()`;
 }
 
-async function fetchActivityList(token) {
+async function fetchActivityList(token, fetch = globalThis.fetch) {
   const url = new URL(ACTIVITY_LIST_URL);
   // The student feed requires all four filters; zero means no restriction.
   url.search = new URLSearchParams({ college_id: "0", grade: "0", class_id: "0", role_id: "0", page: "1", page_size: "50" }).toString();

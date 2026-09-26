@@ -18,13 +18,12 @@ function isPortal(value) {
   } catch { return false; }
 }
 
-let authentication;
 async function authenticatePortalWithPlaywright(options) {
-  if (!authentication) authentication = authenticatePortal(options).finally(() => { authentication = null; });
-  return authentication;
+  return authenticatePortalOnce(options);
 }
-async function authenticatePortal({ startUrl, account, password, forceRefresh = false }) {
-  const window = new BrowserWindow();
+
+async function authenticatePortalOnce({ startUrl, account, password, forceRefresh = false, signal }) {
+  const window = new BrowserWindow({}, signal);
   try {
     // A live portal cookie does not imply the shared CAS session is still valid.
     const loginUrl = new URL("https://auth.bupt.edu.cn/authserver/login");
@@ -33,6 +32,7 @@ async function authenticatePortal({ startUrl, account, password, forceRefresh = 
     let submitted = false;
     const deadline = Date.now() + 120_000;
     while (Date.now() < deadline) {
+      signal?.throwIfAborted();
       const url = window.webContents.getURL();
       if (isPortal(url)) return await call("cookies");
       const host = new URL(url).hostname;
@@ -67,11 +67,10 @@ async function authenticatePortal({ startUrl, account, password, forceRefresh = 
           }
         })()`));
         submitted = true;
-        await window.show();
       }
       await pause(500);
     }
-    throw new Error("统一认证未完成，请检查账号密码或在登录窗口完成验证");
+    throw new Error("统一认证未完成，请检查账号密码或到官方页面完成验证");
   } finally { window.destroy(); }
 }
 

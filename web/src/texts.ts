@@ -100,7 +100,7 @@ export const TEXTS = {
     summaryLoading: "正在读取官方通知并生成摘要…",
     summaryUnavailable: "暂时无法生成摘要，请查看原文链接",
     summaryFailed: "通知摘要生成失败",
-    relogin: "重新登录（可能会短暂打开浏览器）",
+    relogin: "重新登录",
     cacheNotice: "在线刷新失败，正在显示最近一次真实缓存请重新登录后再试",
   },
 } as const;

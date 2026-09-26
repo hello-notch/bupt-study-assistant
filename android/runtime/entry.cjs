@@ -1,13 +1,24 @@
 const { call, BrowserWindow, nativeFetch } = require("./platform.cjs");
 const { createLocalRuntime } = require("../../client/local-runtime.cjs");
+const { retryCampus } = require("./retry.cjs");
 
 globalThis.fetch = nativeFetch;
 globalThis.Buffer = { from: (value) => new Uint8Array(value) };
 globalThis.process = { versions: { chrome: "130.0.0.0" } };
-function makeRuntime(signal) { return createLocalRuntime({
+function makeRuntime(signal) {
+  let operationSignal = signal;
+  return createLocalRuntime({
+  android: true,
+  getSignal: () => operationSignal,
+  runCampusOperation: (label, operation) => retryCampus(label, async (attempt, currentSignal) => {
+    operationSignal = currentSignal;
+    return operation(attempt);
+  }, signal),
+  fetchImpl: (url, init = {}) => nativeFetch(url, { ...init,
+    signal: AbortSignal.any([operationSignal, ...(init.signal ? [init.signal] : [])]) }),
   app: { getPath: () => "private" },
   BrowserWindow: class extends BrowserWindow {
-    constructor(options) { super(options, signal); }
+    constructor(options) { super(options, operationSignal); }
   },
   // Native file operations encrypt every stored value with Android Keystore.
   safeStorage: { isEncryptionAvailable: () => true, encryptString: (value) => value, decryptString: (value) => value },
@@ -19,7 +30,10 @@ globalThis.__cancelRequest = (id) => requests.get(id)?.abort(new Error("操作�
 globalThis.__request = async (id, route, init) => {
   const controller = new AbortController();
   requests.set(id, controller);
-  const timer = setTimeout(() => controller.abort(new Error("请求超时，请检查网络后重试")), route === "/api/courses/mine" ? 65_000 : 180_000);
+  const timeout = route === "/api/courses/mine" ? 65_000 :
+    ["/api/campus", "/api/campus/relogin"].includes(route) ? 650_000 :
+    route === "/api/homework/sync" ? 330_000 : 180_000;
+  const timer = setTimeout(() => controller.abort(new Error("请求超时，请检查网络后重试")), timeout);
   try {
     const result = await Promise.race([
       makeRuntime(controller.signal).request(route, init),

@@ -5,6 +5,7 @@ const path = require("node:path");
 const { chromium } = require("../client/node_modules/playwright");
 
 async function main() {
+  const android = process.argv.includes("--android");
   const root = path.resolve(__dirname, "../web/dist");
   const output = path.resolve(__dirname, "../.test-tmp/homework-ui");
   await fs.mkdir(output, { recursive: true });
@@ -21,7 +22,8 @@ async function main() {
   try {
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-    await context.addInitScript(() => {
+    await context.addInitScript(android => {
+      if (android) document.addEventListener("DOMContentLoaded", () => { document.documentElement.dataset.platform = "android"; });
       const now = new Date().toISOString();
       const accountKey = "a".repeat(64);
       const dueAt = "2099-09-25T12:00:00.000Z";
@@ -33,17 +35,29 @@ async function main() {
       if (sessionStorage.getItem("homework-empty")) window.homeworkFixture.items = [];
       window.homeworkFail = false;
       localStorage.setItem("youxueban-state-v9", JSON.stringify({
+        electricityDormitory: "A410",
+        electricityHistory: Array.from({length:8}, (_,index) => ({
+          date:new Date(Date.now()+8*3600000-(7-index)*86400000).toISOString().slice(0,10),
+          balance:30-index*2, unit:"元", dormitory:"A410", accountKey,
+        })),
         profileName: "回归测试", preferences: { reduceMotion: true, browserNotifications: false, soundNotifications: false },
         tasks: [{ id: 1, title: "个人任务", course: "计划", dueAt: "2099-12-25T12:00:00.000Z", status: "todo", reminderMinutes: 60, createdAt: now }],
         courses: [
           { id: 1, name: "现代控制理论", weekday: 1, startSection: 3, endSection: 4, weeks: "1", color: "blue" },
           { id: 2, name: "系统工程", weekday: 5, startSection: 10, endSection: 11, weeks: "1", color: "green" },
           { id: 3, name: "周末课程", weekday: 7, startSection: 13, endSection: 14, weeks: "2", color: "rose" },
+          ...(android ? Array.from({length:14},(_,index)=>({
+            id:10+index, name:`单节课程${index+1}`, weekday:7, startSection:index+1, endSection:index+1, weeks:"3",color:"blue",
+          })) : []),
         ].map(course => ({ ...course, location: "教学实验综合楼-N308", teacher: "测试教师", startTime: "09:50", endTime: "11:25", reminderMinutes: 0 })),
       }));
       window.youxuebanRuntime = {
+        ...(android ? { syncReminders: () => true } : {}),
         notify: async () => true,
         request: async route => {
+          if (route === "/api/electricity/query") return {status:200,body:{
+            dormitory:"A410",balance:16,unit:"元",updatedAt:now,queriedAt:now,sourceUrl:"https://app.bupt.edu.cn/buptdf/wap/default/chong",
+          }};
           if (route === "/api/homework/sync") return window.homeworkFail
             ? { status: 502, body: { error: "测试网络异常，已保留现有作业" } }
             : { status: 200, body: JSON.parse(JSON.stringify(window.homeworkFixture)) };
@@ -52,7 +66,7 @@ async function main() {
             : { items: [], statuses: [], errors: [] } };
         },
       };
-    });
+    }, android);
     const page = await context.newPage();
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
@@ -63,6 +77,7 @@ async function main() {
       const input = page.getByRole("textbox", { name: "查看第几周课程" });
       await input.fill(String(number));
       await input.press("Enter");
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     }
     async function bounds() {
       const result = await page.evaluate(() => {
@@ -73,8 +88,23 @@ async function main() {
       });
       assert.ok(result.right <= result.width);
       assert.ok(result.scrollWidth <= result.width);
-      assert.ok(result.bottom <= result.navTop, JSON.stringify(result));
-      assert.ok(result.scrollHeight <= result.height + 1, JSON.stringify(result));
+      if (android) {
+        const overflowing = await page.locator(".schedule-wrap").evaluate(el => el.scrollHeight > el.clientHeight + 1);
+        const sizes = await page.locator(".section-label:not(.empty-section):visible").evaluateAll(els => els.map(el => el.getBoundingClientRect().height));
+        assert.ok(sizes.every(size => size >= 39.9), JSON.stringify(sizes));
+        assert.ok(await page.locator(".course-cell").evaluateAll(els => els.every(el => el.getBoundingClientRect().height >= 127.9)));
+        const bottomGap = await page.evaluate(() => {
+          const wrap = document.querySelector(".schedule-wrap").getBoundingClientRect();
+          const nav = document.querySelector(".mobile-nav").getBoundingClientRect();
+          const empty = document.querySelector(".courses-page > .empty-state")?.getBoundingClientRect().height || 0;
+          return nav.top - wrap.bottom - empty;
+        });
+        assert.ok(bottomGap >= -1 && bottomGap <= 12, `Unexpected bottom gap: ${bottomGap}`);
+        await page.locator(".schedule-wrap").evaluate(el => { el.scrollTop = el.scrollHeight; });
+        if (overflowing) assert.ok(await page.locator(".schedule-wrap").evaluate(el => el.scrollTop > 0));
+        await page.locator(".schedule-wrap").evaluate(el => { el.scrollTop = 0; });
+      } else assert.ok(result.bottom <= result.navTop, JSON.stringify(result));
+      if (!android) assert.ok(result.scrollHeight <= result.height + 1, JSON.stringify(result));
     }
     for (const [width, height] of [[320, 640], [390, 844], [720, 900]]) {
       await page.setViewportSize({ width, height });
@@ -89,7 +119,22 @@ async function main() {
       assert.equal(await page.locator(".day-header:visible").count(), 7);
       assert.equal(await page.locator(".section-label:visible").count(), 14);
       await bounds();
+      if (android) {
+        const course = await page.locator(".course-cell").boundingBox();
+        assert.ok(course.height <= 146.1, `Sparse week stretched course to ${course.height}`);
+      }
       await page.screenshot({ path: path.join(output, `weekend-${width}.png`) });
+      if (android) {
+        await week(3);
+        await bounds();
+        assert.equal(await page.locator(".course-cell").count(),14);
+        assert.ok(await page.locator(".schedule-wrap").evaluate(el=>el.scrollHeight>el.clientHeight));
+        await page.locator(".schedule-wrap").evaluate(el=>{el.scrollTop=el.scrollHeight;});
+        const last = await page.locator(".course-cell").last().boundingBox();
+        const wrap = await page.locator(".schedule-wrap").boundingBox();
+        assert.ok(last.y + last.height <= wrap.y + wrap.height + 1);
+        await page.screenshot({path:path.join(output,`dense-bottom-${width}.png`)});
+      }
       await week(22);
       assert.equal(await page.locator(".course-cell").count(), 0);
       assert.equal(await page.locator(".section-label:visible").count(), 14);
@@ -98,6 +143,14 @@ async function main() {
     }
     await page.setViewportSize({ width: 390, height: 844 });
     await week(1);
+    if (android) {
+      await page.locator(".course-homework-badge").first().waitFor();
+      assert.equal(await page.locator(".course-homework-badge").count(), 2);
+      assert.ok(await page.locator(".course-homework-badge").evaluateAll(badges => badges.every(badge => {
+        const a = badge.getBoundingClientRect(), b = badge.parentElement.getBoundingClientRect();
+        return a.top >= b.top && a.bottom <= b.bottom && a.right <= b.right;
+      })));
+    }
     await page.locator(".course-cell").first().click();
     await page.getByRole("button", { name: "查看作业", exact: true }).click();
     await page.locator(".homework-course-filter").waitFor();
@@ -105,7 +158,7 @@ async function main() {
     assert.ok((await page.locator(".homework-row").innerText()).includes("现代控制理论"));
     await page.getByRole("button", { name: "清除课程筛选" }).click();
     assert.equal(await page.locator(".task-row").count(), 3);
-    assert.ok((await page.locator(".task-row").first().innerText()).includes("个人任务"));
+    if (!android) assert.ok((await page.locator(".task-row").first().innerText()).includes("个人任务"));
     assert.equal(await page.locator(".homework-row").getByRole("button", { name: "删除任务", exact: true }).count(), 0);
     assert.equal(await page.locator(".homework-row").getByRole("button", { name: "编辑任务", exact: true }).count(), 0);
     assert.ok(await page.locator(".homework-row .task-check").first().isDisabled());
@@ -136,14 +189,28 @@ async function main() {
     await page.screenshot({ path: path.join(output, "submitted.png") });
     await page.reload();
     await page.getByRole("button", { name: "已提交 1", exact: true }).waitFor();
-    assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("youxueban-state-v10")).tasks.filter(task => task.homework).length), 1);
+    assert.equal(await page.evaluate(android => JSON.parse(localStorage.getItem(android ? "youxueban-state-android-v11" : "youxueban-state-v10")).tasks.filter(task => task.homework).length, android), 1);
     await nav.getByRole("button", { name: "课程", exact: true }).click();
     await week(1);
     await page.setViewportSize({ width: 1280, height: 900 });
     assert.equal(await page.locator(".day-header:visible").count(), 7);
     assert.equal(await page.locator(".section-label:visible").count(), 14);
+    if (android) {
+      await page.getByRole("button", {name:"查电费",exact:true}).click();
+      await page.locator(".electricity-chart").waitFor();
+      assert.equal(await page.locator(".electricity-daily-values li").count(),7);
+      assert.equal(await page.locator(".electricity-chart-point").count(),7);
+      assert.equal(await page.locator(".electricity-chart-axis").evaluate(el=>getComputedStyle(el).fill),"none");
+      for(const width of [320,390,720,1280]) {
+        await page.setViewportSize({width,height:900});
+        assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth===document.documentElement.clientWidth));
+        await page.screenshot({path:path.join(output,`electricity-${width}.png`),fullPage:true});
+      }
+    }
     assert.deepEqual(errors, []);
-    console.log("PASS: compact weekdays/weekends/empty weeks at 320/390/720px; desktop unchanged; course filter; homework detail/XSS; system-only status; fail-retention; submitted deletion; migration.");
+    console.log(android
+      ? "PASS: Android per-course minimum height, bottom spacing and scrolling, homework badges, course filtering, reconciliation, migration, seven-day electricity chart at 320/390/720/1280px."
+      : "PASS: desktop layout unchanged; course filtering, homework detail/XSS, reconciliation, fail-retention, submitted deletion and migration.");
   } finally {
     await browser?.close();
     await new Promise(resolve => server.close(resolve));

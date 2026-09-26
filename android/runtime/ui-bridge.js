@@ -26,7 +26,8 @@
           signal?.removeEventListener("abort", abort);
           AndroidUI.cancel(id);
           resolve({ status: 504, body: { error: "设备请求超时，请检查网络后重试" } });
-        }, 240_000);
+        }, ["/api/campus", "/api/campus/relogin"].includes(route) ? 670_000 :
+          route === "/api/homework/sync" ? 350_000 : 240_000);
         signal?.addEventListener("abort", abort, { once: true });
         pending.set(id, { resolve: result => { signal?.removeEventListener("abort", abort); resolve(result); }, timer });
         AndroidUI.request(id, String(route), JSON.stringify(init));

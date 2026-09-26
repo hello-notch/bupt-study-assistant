@@ -51,6 +51,18 @@ test("selected-week layout retains spanning sections, hides empty weekends and t
   assert.equal(scheduleLayout([]).occupied.filter(Boolean).length, 14);
 });
 
+test("Android courses share their minimum height across sections without changing desktop rows", () => {
+  const courses = [{ weekday: 1, startSection: 3, endSection: 4 }, { weekday: 2, startSection: 6, endSection: 8 }];
+  const rows = [...scheduleLayout(courses, true).rows.matchAll(/minmax\((\d+)px, (\d+)px\)/g)]
+    .map(match => [Number(match[1]), Number(match[2])]);
+  assert.deepEqual(rows, [[54, 58], [54, 58], [36, 40], [36, 40], [36, 40]]);
+  assert.ok(scheduleLayout(courses).rows.includes("minmax(0, 1fr)"));
+  const mixed = scheduleLayout([...courses, { weekday: 3, startSection: 4, endSection: 4 }], true);
+  assert.ok(mixed.rows.includes("minmax(108px, 112px)"));
+  assert.equal(mixed.lastSection, 8);
+  assert.equal(scheduleLayout([], true).rows.match(/minmax\(32px/g).length, 14);
+});
+
 test("official undone envelope must be complete; only assignment type 3 is imported", () => {
   assert.deepEqual(cloud.undoneRows({ undoneNum: 0, undoneList: [] }), []);
   assert.deepEqual(cloud.undoneRows({ undoneNum: 2, undoneList: [row, { type: 5, activityId: "peer-review" }] }), [row]);

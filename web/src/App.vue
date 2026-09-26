@@ -7,8 +7,10 @@ import { renderAssistantContent } from "./assistant-markdown";
 import { courseTimes, isSameCourseSession, normalizeImportedCourses, normalizeWeeks, parseCourseFile, type ImportedCourse } from "./course-import";
 import { apiFetch } from "./auth";
 import { scheduleLayout } from "./schedule-layout";
+import { chinaDate, hasSnapshotForDate, saveSnapshot, usageChart } from "./electricity-history";
 import { canDeleteTask, compareTasks, isHomeworkSnapshot, reconcileHomework, sameHomeworkCourse } from "./homework";
 import { TEXTS } from "./texts";
+import { activityConflict, campusTimestamp, registrationAlarm, taskAlarm, taskReminderTarget, type TimeInterval } from "./android-tasks";
 import type {
   AssistantAttachment,
   AssistantConversation,
@@ -20,8 +22,10 @@ import type {
   CampusKind,
   Course,
   ElectricityResult,
+  ElectricitySnapshot,
   PageId,
   Preferences,
+  RegistrationReminder,
   StudyTask,
 } from "./types";
 
@@ -119,8 +123,9 @@ function assistantFunction(name: string, description: string, properties: Record
   return { type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } };
 }
 
-const STORAGE_KEY = "youxueban-state-v10";
-const LEGACY_STORAGE_KEYS = ["youxueban-state-v9", "youxueban-state-v8", "youxueban-state-v7", "youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
+const isAndroidRuntime = Boolean(window.youxuebanRuntime?.syncReminders);
+const STORAGE_KEY = isAndroidRuntime ? "youxueban-state-android-v11" : "youxueban-state-v10";
+const LEGACY_STORAGE_KEYS = ["youxueban-state-v10", "youxueban-state-v9", "youxueban-state-v8", "youxueban-state-v7", "youxueban-state-v6", "youxueban-state-v5", "youxueban-state-v4", "youxueban-state-v3", "youxueban-state-v2", "youxueban-demo-state-v1"];
 const MAX_ASSISTANT_FILE_SIZE = 1_000_000;
 const MAX_ASSISTANT_ATTACHMENTS = 2;
 const ASSISTANT_TOKEN_ESTIMATE_OVERHEAD = 300;
@@ -178,6 +183,7 @@ const saved = (() => {
       profileName: string;
       profileAvatar: string;
       tasks: StudyTask[];
+      registrationReminders: RegistrationReminder[];
       courses: Course[];
       campusItems: CampusItem[];
       notifications: AppNotification[];
@@ -185,6 +191,7 @@ const saved = (() => {
       assistantConversations: AssistantConversation[];
       activeConversationId: string;
       electricityDormitory: string;
+      electricityHistory: ElectricitySnapshot[];
       sidebarWidth: number;
     }>;
   } catch {
@@ -196,7 +203,6 @@ const initialPageHash = location.hash.replace("#/", "") as PageId;
 const initialPage = [...navItems.map((item) => item.id), "notifications", "settings"].includes(initialPageHash) ? initialPageHash : "today";
 const currentPage = ref<PageId>(initialPage);
 const pageHistory: PageId[] = [];
-const isAndroidRuntime = Boolean(window.youxuebanRuntime?.syncReminders);
 function requestNativeReminderPermissions(): void {
   window.youxuebanRuntime?.requestReminderPermissions?.();
 }
@@ -226,6 +232,7 @@ const profileEditError = ref("");
 const welcomeName = ref("");
 const welcomeError = ref("");
 const tasks = ref<StudyTask[]>((saved.tasks ?? []).map((task) => ({ ...task, remindDuringQuiet: task.remindDuringQuiet ?? false })));
+const registrationReminders = ref<RegistrationReminder[]>(saved.registrationReminders ?? []);
 const courses = ref<Course[]>(normalizeCourseColors((saved.courses ?? []).map((course) => ({
   ...course,
   ...courseTimes(course.startSection, course.endSection),
@@ -267,6 +274,7 @@ const courseEditing = ref(false);
 const courseForm = ref<Omit<Course, "id">>(blankCourse());
 const pendingCourseSlot = ref<{ weekday: number; startSection: number } | null>(null);
 const taskFilter = ref<"todo" | "all" | "done" | "submitted">("todo");
+const taskKindFilter = ref<"all" | "todo" | "schedule">("all");
 const taskSearch = ref("");
 const homeworkCourse = ref("");
 const homeworkBusy = ref(false);
@@ -304,13 +312,19 @@ const assistantChatPanel = ref<HTMLElement | null>(null);
 const assistantDeleteConfirmId = ref<string | null>(null);
 const deleteConfirmId = ref<number | null>(null);
 const courseDeleteConfirming = ref(false);
-const taskForm = ref({ title: "", course: "", dueAt: "", reminderMinutes: 60, remindDuringQuiet: false });
+const taskForm = ref({ title: "", course: "", kind: "todo" as "todo" | "schedule", startAt: "", dueAt: "", reminderMinutes: 60, remindDuringQuiet: false });
 const clock = ref(new Date());
 const selectedWeek = ref(1);
 const suggestionIndex = ref(0);
 const resetConfirming = ref(false);
 const courseClearConfirming = ref(false);
 const electricityDormitory = ref(saved.electricityDormitory?.trim() ?? "");
+const electricityHistory = ref<ElectricitySnapshot[]>(Array.isArray(saved.electricityHistory)
+  ? saved.electricityHistory.filter((item): item is ElectricitySnapshot => Boolean(item)
+    && /^\d{4}-\d{2}-\d{2}$/.test(item.date)
+    && Number.isFinite(item.balance)
+    && (item.unit === "元" || item.unit === "度"))
+  : []);
 const electricityDormitoryDraft = ref(electricityDormitory.value);
 const electricityResult = ref<ElectricityResult | null>(null);
 const electricityBusy = ref(false);
@@ -334,6 +348,7 @@ const aiDeleteConfirming = ref(false);
 const sidebarWidth = ref(Math.max(190, Math.min(320, Number(saved.sidebarWidth) || 224)));
 let clockTimer: number | undefined;
 let reminderTimer: number | undefined;
+let electricityDailyAttemptKey = "";
 let resetConfirmTimer: number | undefined;
 let courseClearConfirmTimer: number | undefined;
 let courseDeleteConfirmTimer: number | undefined;
@@ -381,14 +396,30 @@ const greeting = computed(() => {
 const profileInitial = computed(() => profileName.value.trim().slice(0, 1) || "邮");
 const unreadCount = computed(() => notifications.value.filter((item) => !item.read).length);
 const accountTasks = computed(() => tasks.value.filter(task => !task.homework || task.homework.accountKey === localSettings.value.campus.accountKey));
-const todoTasks = computed(() => accountTasks.value.filter((task) => task.status === "todo").sort(compareTasks));
+const kindTasks = computed(() => accountTasks.value.filter(task => !isAndroidRuntime || taskKindFilter.value === "all" || (task.kind ?? "todo") === taskKindFilter.value));
+function comparePlatformTasks(first: StudyTask, second: StudyTask): number {
+  return isAndroidRuntime ? (taskReminderTarget(first) || "9999").localeCompare(taskReminderTarget(second) || "9999") || first.id - second.id : compareTasks(first, second);
+}
+const todoTasks = computed(() => accountTasks.value.filter((task) => task.status === "todo").sort(comparePlatformTasks));
 const currentAcademicWeek = computed(() => weekNumberFor(clock.value));
 const weekStart = computed(() => academicWeekMonday(selectedWeek.value));
 const weekDates = computed(() => weekdays.map((label, index) => ({ label, date: addDays(weekStart.value, index) })));
 const visibleCourses = computed(() => courses.value
   .filter((course) => courseOccursInWeek(course, selectedWeek.value))
   .sort((a, b) => a.weekday - b.weekday || a.startSection - b.startSection));
-const compactSchedule = computed(() => scheduleLayout(visibleCourses.value));
+const compactSchedule = computed(() => scheduleLayout(visibleCourses.value, isAndroidRuntime));
+const homeworkCourseNames = computed(() => new Set(accountTasks.value
+  .filter(task => task.homework && task.status === "todo")
+  .map(task => task.course.trim())
+  .filter(Boolean)));
+function courseHasHomework(course: Course): boolean {
+  return [...homeworkCourseNames.value].some(name => sameHomeworkCourse(name, course.name));
+}
+const electricityChart = computed(() => {
+  const unit = electricityResult.value?.unit ?? [...electricityHistory.value].reverse().find(item =>
+    item.dormitory === electricityDormitory.value && item.accountKey === localSettings.value.campus.accountKey)?.unit ?? "元";
+  return usageChart(electricityHistory.value, electricityDormitory.value, localSettings.value.campus.accountKey || "", unit, clock.value.getTime());
+});
 const todayCourses = computed(() => courses.value
   .filter((course) => course.weekday === todayWeekday.value && courseOccursInWeek(course, currentAcademicWeek.value))
   .sort((a, b) => a.startSection - b.startSection));
@@ -432,11 +463,11 @@ const assistantTokenLabel = computed(() => {
 });
 const filteredTasks = computed(() => {
   const query = taskSearch.value.trim().toLowerCase();
-  return accountTasks.value
+  return kindTasks.value
     .filter((task) => taskFilter.value === "all" || task.status === taskFilter.value)
     .filter(task => !homeworkCourse.value || (task.homework && sameHomeworkCourse(task.course, homeworkCourse.value)))
     .filter((task) => !query || `${task.title} ${task.course}`.toLowerCase().includes(query))
-    .sort(compareTasks);
+    .sort(comparePlatformTasks);
 });
 const filteredCampusItems = computed(() => {
   const query = campusSearch.value.trim().toLowerCase();
@@ -476,12 +507,13 @@ const studySuggestions = computed(() => {
 });
 const currentSuggestion = computed(() => studySuggestions.value[suggestionIndex.value % studySuggestions.value.length]);
 
-watch([profileName, profileAvatar, tasks, courses, campusItems, notifications, preferences, assistantConversations, activeConversationId, electricityDormitory, sidebarWidth], () => {
+watch([profileName, profileAvatar, tasks, registrationReminders, courses, campusItems, notifications, preferences, assistantConversations, activeConversationId, electricityDormitory, electricityHistory, sidebarWidth], () => {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       profileName: profileName.value,
       profileAvatar: profileAvatar.value,
       tasks: tasks.value,
+      ...(isAndroidRuntime ? { registrationReminders: registrationReminders.value } : {}),
       courses: courses.value,
       campusItems: campusItems.value,
       notifications: notifications.value,
@@ -489,6 +521,7 @@ watch([profileName, profileAvatar, tasks, courses, campusItems, notifications, p
       assistantConversations: assistantConversations.value,
       activeConversationId: activeConversationId.value,
       electricityDormitory: electricityDormitory.value,
+      electricityHistory: electricityHistory.value,
       sidebarWidth: sidebarWidth.value,
     }));
   } catch {
@@ -497,7 +530,7 @@ watch([profileName, profileAvatar, tasks, courses, campusItems, notifications, p
 }, { deep: true });
 
 watch(() => preferences.value.theme, applyTheme, { immediate: true });
-watch([accountTasks, courses, preferences], syncNativeReminders, { deep: true });
+watch([accountTasks, registrationReminders, courses, preferences], syncNativeReminders, { deep: true });
 watch(() => preferences.value.reduceMotion, async (reduceMotion) => {
   applyMotionPreference();
   if (reduceMotion) {
@@ -548,7 +581,11 @@ onMounted(async () => {
   syncNativeReminders();
   if ("scrollRestoration" in history) history.scrollRestoration = "manual";
   window.scrollTo({ top: 0, behavior: "auto" });
-  clockTimer = window.setInterval(() => { clock.value = new Date(); }, 1000);
+  clockTimer = window.setInterval(() => {
+    const previousDate = chinaDate(clock.value.getTime());
+    clock.value = new Date();
+    if (chinaDate(clock.value.getTime()) !== previousDate) ensureDailyElectricitySnapshot();
+  }, 1000);
   reminderTimer = window.setInterval(checkDueReminders, 5_000);
   window.addEventListener("focus", checkDueReminders);
   document.addEventListener("visibilitychange", checkRemindersWhenVisible);
@@ -557,6 +594,8 @@ onMounted(async () => {
   homeworkTimer = window.setInterval(refreshHomeworkWhenVisible, 5 * 60_000);
   window.addEventListener("focus", refreshHomeworkWhenVisible);
   document.addEventListener("visibilitychange", refreshHomeworkWhenVisible);
+  window.addEventListener("focus", ensureDailyElectricitySnapshot);
+  document.addEventListener("visibilitychange", ensureDailyElectricitySnapshot);
   if (localSettings.value.campus.configured) void syncHomework();
   if (localSettings.value.ai.configured) void detectAiModels();
   try {
@@ -593,6 +632,8 @@ onBeforeUnmount(() => {
   if (homeworkTimer !== undefined) window.clearInterval(homeworkTimer);
   window.removeEventListener("focus", refreshHomeworkWhenVisible);
   document.removeEventListener("visibilitychange", refreshHomeworkWhenVisible);
+  window.removeEventListener("focus", ensureDailyElectricitySnapshot);
+  document.removeEventListener("visibilitychange", ensureDailyElectricitySnapshot);
   if (clockTimer !== undefined) window.clearInterval(clockTimer);
   if (reminderTimer !== undefined) window.clearInterval(reminderTimer);
   if (resetConfirmTimer !== undefined) window.clearTimeout(resetConfirmTimer);
@@ -616,6 +657,20 @@ function refreshHomeworkWhenVisible(): void {
   if (document.visibilityState === "visible" && localSettings.value.campus.configured && Date.now() - homeworkLastAttempt > 30_000) void syncHomework();
 }
 
+function ensureDailyElectricitySnapshot(): void {
+  if (!isAndroidRuntime || document.visibilityState !== "visible" || !localSettings.value.campus.configured
+    || !electricityDormitory.value || electricityBusy.value) return;
+  const date = chinaDate(Date.now());
+  const accountKey = localSettings.value.campus.accountKey || "";
+  if (!date || hasSnapshotForDate(electricityHistory.value, date, electricityDormitory.value, accountKey)) return;
+  const attemptKey = `${date}:${electricityDormitory.value}:${accountKey}`;
+  if (electricityDailyAttemptKey === attemptKey) return;
+  electricityDailyAttemptKey = attemptKey;
+  void queryElectricity(true).then((result) => {
+    if (!result) electricityDailyAttemptKey = "";
+  });
+}
+
 function cancelHomeworkSync(): void {
   homeworkController?.abort();
 }
@@ -629,7 +684,7 @@ async function syncHomework(interactive = false): Promise<void> {
   homeworkBusy.value = true;
   homeworkError.value = "";
   homeworkLastAttempt = Date.now();
-  const timer = window.setTimeout(() => controller.abort(), 170_000);
+  const timer = window.setTimeout(() => controller.abort(), isAndroidRuntime ? 340_000 : 170_000);
   try {
     const response = await apiFetch("/api/homework/sync", { method: "POST", body: JSON.stringify({ interactive }), signal: controller.signal });
     const payload = await response.json();
@@ -652,6 +707,7 @@ async function syncHomework(interactive = false): Promise<void> {
 function viewCourseHomework(): void {
   if (!selectedCourse.value) return;
   homeworkCourse.value = selectedCourse.value.name;
+  if (isAndroidRuntime) taskKindFilter.value = "todo";
   taskSearch.value = "";
   taskFilter.value = "all";
   selectedCourse.value = null;
@@ -1358,6 +1414,7 @@ async function resetAllPersonalData(): Promise<void> {
   accountBindingOpen.value = false;
   aiConfigOpen.value = false;
   tasks.value = [];
+  registrationReminders.value = [];
   taskModalOpen.value = false;
   editingTaskId.value = null;
   courses.value = [];
@@ -1444,6 +1501,8 @@ function openTaskModal(prefill = ""): void {
   due.setHours(20, 0, 0, 0);
   taskForm.value = {
     title: prefill,
+    kind: isAndroidRuntime && taskKindFilter.value === "schedule" ? "schedule" : "todo",
+    startAt: toDateTimeInput(new Date(due.getTime() - 60 * 60_000)),
     course: "",
     dueAt: toDateTimeInput(due),
     reminderMinutes: preferences.value.defaultTaskReminder,
@@ -1465,12 +1524,94 @@ function formatCampusDate(value: string, withTime = false): string {
   }).format(date);
 }
 
+const courseIntervals = computed(() => {
+  const result: Array<TimeInterval & { course: Course }> = [];
+  for (let week = 1; week <= MAX_ACADEMIC_WEEK; week++) {
+    for (const course of courses.value) {
+      if (!courseOccursInWeek(course, week)) continue;
+      const date = addDays(academicWeekMonday(week), course.weekday - 1);
+      const start = new Date(date);
+      const end = new Date(date);
+      const [sh = 0, sm = 0] = course.startTime.split(":").map(Number);
+      const [eh = 0, em = 0] = course.endTime.split(":").map(Number);
+      start.setHours(sh, sm, 0, 0);
+      end.setHours(eh, em, 0, 0);
+      result.push({ start: start.getTime(), end: end.getTime(), course });
+    }
+  }
+  return result;
+});
+const upcomingCourseSchedules = computed(() => courseIntervals.value
+  .filter(entry => entry.end > clock.value.getTime() && entry.start < clock.value.getTime() + 7 * 86400_000)
+  .filter(entry => !taskSearch.value.trim() || entry.course.name.includes(taskSearch.value.trim()))
+  .sort((a, b) => a.start - b.start));
+const activityConflicts = computed(() => Object.fromEntries(campusItems.value
+  .filter(item => item.kind === "activity").map(item => {
+    const intervals: TimeInterval[] = [...courseIntervals.value];
+    for (const task of accountTasks.value) {
+      if (task.kind !== "schedule" || task.status !== "todo" || task.activityId === item.id) continue;
+      intervals.push({ start: Date.parse(task.startAt || ""), end: Date.parse(task.dueAt) });
+    }
+    return [item.id, activityConflict(item, intervals)];
+  })));
+
+function activityScheduled(item: CampusItem): boolean {
+  return accountTasks.value.some(task => task.activityId === item.id && task.kind === "schedule");
+}
+
+function addActivitySchedule(item: CampusItem): void {
+  if (activityScheduled(item)) { showToast("该活动已加入日程"); return; }
+  const start = campusTimestamp(item.eventTime), end = campusTimestamp(item.eventEndTime);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    showToast("活动起止时间不完整，无法加入日程"); return;
+  }
+  if (start <= Date.now()) { showToast("活动已开始，无法添加开始提醒"); return; }
+  tasks.value.push({
+    id: Math.max(0, ...tasks.value.map(task => task.id)) + 1,
+    title: item.title, course: "第二课堂", kind: "schedule", activityId: item.id,
+    startAt: new Date(start).toISOString(), dueAt: new Date(end).toISOString(),
+    reminderMinutes: preferences.value.defaultTaskReminder, remindDuringQuiet: false,
+    status: "todo", createdAt: new Date().toISOString(),
+  });
+  requestNativeReminderPermissions();
+  showToast("已加入日程");
+}
+
+function toggleRegistrationReminder(item: CampusItem): void {
+  const index = registrationReminders.value.findIndex(reminder => reminder.activityId === item.id);
+  if (index >= 0) {
+    registrationReminders.value.splice(index, 1);
+    showToast("已取消报名提醒");
+    return;
+  }
+  const reminder = { activityId: item.id, title: item.title, registrationStartTime: item.registrationStartTime || "" };
+  if (!registrationAlarm(reminder, preferences.value.registrationReminder ?? 5, Date.now())) {
+    showToast("报名时间未提供或提醒时间已过"); return;
+  }
+  registrationReminders.value.push(reminder);
+  requestNativeReminderPermissions();
+  showToast(preferences.value.browserNotifications ? `已设置报名前 ${preferences.value.registrationReminder ?? 5} 分钟提醒` : "报名提醒已保存，请在设置中开启系统通知");
+}
+
+function updateRegistrationReminder(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const value = Number(input.value);
+  if (input.value.trim() && Number.isInteger(value) && value >= 0 && value <= 10080) {
+    preferences.value.registrationReminder = value;
+  } else {
+    input.value = String(preferences.value.registrationReminder ?? 5);
+    showToast("请输入 0 至 10080 的整数分钟");
+  }
+}
+
 function openTaskEdit(task: StudyTask): void {
   if (task.homework) return;
   clearTaskDeleteConfirmation();
   editingTaskId.value = task.id;
   taskForm.value = {
     title: task.title,
+    kind: task.kind ?? "todo",
+    startAt: task.startAt ? toDateTimeInput(new Date(task.startAt)) : "",
     course: task.course,
     dueAt: toDateTimeInput(new Date(task.dueAt)),
     reminderMinutes: task.reminderMinutes ?? 0,
@@ -1490,14 +1631,22 @@ function createTask(): void {
     showToast(TEXTS.validation.taskDuePast);
     return;
   }
+  const kind = isAndroidRuntime ? taskForm.value.kind : "todo";
+  const startAt = kind === "schedule" ? new Date(taskForm.value.startAt) : null;
+  if (startAt && (!Number.isFinite(startAt.getTime()) || startAt >= dueAt || startAt.getTime() <= Date.now())) {
+    showToast("日程开始时间须晚于现在，且早于结束时间");
+    return;
+  }
+  const timing = isAndroidRuntime ? { kind, startAt: startAt?.toISOString() } : {};
   const reminderMinutes = taskForm.value.reminderMinutes == null ? null : Math.max(0, Math.min(10080, Number(taskForm.value.reminderMinutes)));
   if (editingTaskId.value !== null) {
     const task = tasks.value.find((item) => item.id === editingTaskId.value);
     if (task && !task.homework) {
-      Object.assign(task, { title, course: taskForm.value.course.trim() || "个人计划", dueAt: dueAt.toISOString(), reminderMinutes, remindDuringQuiet: taskForm.value.remindDuringQuiet, status: "todo" });
+      Object.assign(task, { title, course: taskForm.value.course.trim() || "个人计划", dueAt: dueAt.toISOString(), ...timing, reminderMinutes, remindDuringQuiet: taskForm.value.remindDuringQuiet, status: "todo" });
       taskModalOpen.value = false;
       editingTaskId.value = null;
       checkDueTaskReminders();
+      if (isAndroidRuntime && preferences.value.browserNotifications) requestNativeReminderPermissions();
       showToast(TEXTS.tasks.updated);
       return;
     }
@@ -1507,6 +1656,7 @@ function createTask(): void {
     title,
     course: taskForm.value.course.trim() || "个人计划",
     dueAt: dueAt.toISOString(),
+    ...timing,
     reminderMinutes,
     remindDuringQuiet: taskForm.value.remindDuringQuiet,
     status: "todo",
@@ -1514,6 +1664,7 @@ function createTask(): void {
   });
   taskModalOpen.value = false;
   checkDueTaskReminders();
+  if (isAndroidRuntime && preferences.value.browserNotifications) requestNativeReminderPermissions();
   showToast(TEXTS.tasks.added);
 }
 
@@ -1529,11 +1680,15 @@ function syncNativeReminders(): void {
   const now = Date.now();
   if (preferences.value.browserNotifications) {
     for (const task of accountTasks.value) {
-      if (task.status !== "todo" || task.reminderMinutes == null) continue;
-      const at = new Date(task.dueAt).getTime() - task.reminderMinutes * 60_000;
-      if (!Number.isFinite(at) || at < now || (!task.remindDuringQuiet && isQuietTime(new Date(at)))) continue;
-      items.push({ id: `task:${task.id}:${at}`, at, title: task.reminderMinutes === 0 ? "DDL 到期提醒" : "DDL 提前提醒",
-        body: `${task.title}（截止 ${formatDateTime(task.dueAt)}）` });
+      const alarm = taskAlarm(task, now);
+      if (!alarm || (!task.remindDuringQuiet && isQuietTime(new Date(alarm.at)))) continue;
+      const target = taskReminderTarget(task);
+      items.push({ ...alarm, title: task.kind === "schedule" ? "日程开始提醒" : "待办截止提醒",
+        body: `${task.title}（${task.kind === "schedule" ? "开始" : "截止"} ${formatDateTime(target)}）` });
+    }
+    for (const reminder of registrationReminders.value) {
+      const alarm = registrationAlarm(reminder, preferences.value.registrationReminder ?? 5, now);
+      if (alarm) items.push(alarm);
     }
     for (let week = 1; week <= MAX_ACADEMIC_WEEK; week++) {
       for (const course of courses.value) {
@@ -1560,12 +1715,13 @@ function checkDueTaskReminders(): void {
   const now = Date.now();
   for (const task of accountTasks.value) {
     if (task.status !== "todo" || task.reminderMinutes == null) continue;
-    const dueAt = new Date(task.dueAt).getTime();
+    const target = isAndroidRuntime ? taskReminderTarget(task) : task.dueAt;
+    const dueAt = new Date(target).getTime();
     if (Number.isNaN(dueAt)) continue;
     const remindAt = dueAt - task.reminderMinutes * 60_000;
     if (now < remindAt || now > remindAt + 24 * 60 * 60_000) continue;
-    const title = task.reminderMinutes === 0 ? "DDL 到期提醒" : "DDL 提前提醒";
-    const body = `${task.title}（截止 ${formatDateTime(task.dueAt)}）`;
+    const title = isAndroidRuntime ? task.kind === "schedule" ? "日程开始提醒" : "待办截止提醒" : task.reminderMinutes === 0 ? "DDL 到期提醒" : "DDL 提前提醒";
+    const body = `${task.title}（${isAndroidRuntime && task.kind === "schedule" ? "开始" : "截止"} ${formatDateTime(target)}）`;
     if (notifications.value.some((item) => item.type === "task" && item.title === title && item.body === body)) continue;
     notifications.value.unshift({ id: Date.now(), title, body, createdAt: new Date().toISOString(), type: "task", read: false });
     if (task.remindDuringQuiet || !isQuietTime(new Date())) emitReminder(title, body);
@@ -2046,6 +2202,7 @@ async function queryElectricity(silent = false, dormitoryOverride?: string, thro
   electricityError.value = "";
   try {
     const dormitory = dormitoryOverride?.trim() || electricityDormitory.value;
+    const accountKey = localSettings.value.campus.accountKey;
     const response = await apiFetch("/api/electricity/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2055,6 +2212,7 @@ async function queryElectricity(silent = false, dormitoryOverride?: string, thro
     if (!response.ok || typeof payload.balance !== "number" || !["元", "度"].includes(payload.unit ?? "") || !payload.updatedAt || !payload.queriedAt || !payload.sourceUrl) {
       throw new Error(payload.error || TEXTS.electricity.queryFailed);
     }
+    if (isAndroidRuntime && accountKey !== localSettings.value.campus.accountKey) return null;
     electricityResult.value = {
       dormitory: payload.dormitory || dormitory,
       balance: payload.balance,
@@ -2063,6 +2221,14 @@ async function queryElectricity(silent = false, dormitoryOverride?: string, thro
       queriedAt: payload.queriedAt,
       sourceUrl: payload.sourceUrl,
     };
+    const snapshot: ElectricitySnapshot = {
+      date: chinaDate(payload.queriedAt),
+      balance: payload.balance,
+      unit: payload.unit as ElectricityResult["unit"],
+      dormitory,
+      accountKey,
+    };
+    if (isAndroidRuntime && snapshot.date) electricityHistory.value = saveSnapshot(electricityHistory.value, snapshot);
     if (payload.balance < 10) addLowElectricityNotification(payload.balance, payload.unit as ElectricityResult["unit"], dormitory);
     else if (!silent) showToast(TEXTS.electricity.updated);
     return electricityResult.value;
@@ -2099,6 +2265,7 @@ function unbindElectricity(): void {
   electricityDormitory.value = "";
   electricityDormitoryDraft.value = "";
   electricityResult.value = null;
+  electricityHistory.value = [];
   electricityError.value = "";
   electricityEditing.value = true;
   showToast(TEXTS.electricity.unbound);
@@ -2121,6 +2288,13 @@ async function loadCampusData(relogin = false): Promise<void> {
         ? previous.summary : item.summary;
       return { ...item, summary, read: previous?.read ?? false };
     });
+    if (isAndroidRuntime) {
+      registrationReminders.value = registrationReminders.value.map(reminder => {
+        const item = campusItems.value.find(item => item.kind === "activity" && item.id === reminder.activityId);
+        return item && Number.isFinite(campusTimestamp(item.registrationStartTime))
+          ? { ...reminder, title: item.title, registrationStartTime: item.registrationStartTime! } : reminder;
+      });
+    }
     portalVisibleCount.value = 10;
     campusUpdatedAt.value = payload.updatedAt ?? new Date().toISOString();
     const dropped = payload.items.length - readableItems.length;
@@ -2522,6 +2696,7 @@ async function executeAssistantTool(name: string, args: Record<string, unknown>)
       const task = accountTasks.value.find((item) => item.id === Number(args.ddl_id) && item.status === "todo");
       if (!task) return { success: false, error: "DDL 不存在或已完成" };
       if (task.homework) return { success: false, error: "教学云作业内容与状态只能由系统同步" };
+      if (isAndroidRuntime && task.kind === "schedule") return { success: false, error: "日程包含开始与结束时间，请在任务页编辑日程" };
       if (args.content != null && !String(args.content).trim()) return { success: false, error: "DDL 内容不能为空" };
       if (args.deadline != null) {
         const dueAt = parseAssistantDeadline(String(args.deadline));
@@ -2718,35 +2893,43 @@ function runAssistantAction(message: AssistantMessage): void {
         </section>
 
         <section v-else-if="currentPage === 'tasks'" class="page">
-          <header class="page-heading split"><div><span class="eyebrow">个人事务</span><h1>任务与 DDL</h1><p>{{ TEXTS.pages.tasksDescription }}</p></div><button class="primary-button" type="button" @click="openTaskModal()"><IconGlyph name="plus" />添加任务</button></header>
+          <header class="page-heading split"><div><span class="eyebrow">个人事务</span><h1>{{ isAndroidRuntime ? '任务' : '任务与 DDL' }}</h1><p v-if="!isAndroidRuntime">{{ TEXTS.pages.tasksDescription }}</p></div><button class="primary-button" type="button" @click="openTaskModal()"><IconGlyph name="plus" />添加任务</button></header>
+          <div v-if="isAndroidRuntime" class="segmented android-task-kinds" aria-label="任务类型"><button v-for="kind in [{id:'all',label:'全部任务'},{id:'schedule',label:'日程'},{id:'todo',label:'待办'}]" :key="kind.id" type="button" :class="{ active: taskKindFilter === kind.id }" @click="taskKindFilter = kind.id as typeof taskKindFilter; homeworkCourse = ''">{{ kind.label }}</button></div>
           <div class="homework-sync-bar">
             <span role="status">{{ homeworkBusy ? '正在同步教学云作业' : homeworkError || (homeworkUpdatedAt ? `作业已同步 · ${formatDateTime(homeworkUpdatedAt)}` : '教学云作业尚未同步') }}</span>
             <button v-if="homeworkBusy" class="icon-button" type="button" aria-label="取消作业同步" title="取消作业同步" @click="cancelHomeworkSync"><IconGlyph name="close" /></button>
             <button v-else class="secondary-button" type="button" @click="syncHomework(true)"><IconGlyph name="refresh" />同步作业</button>
           </div>
           <div v-if="homeworkCourse" class="homework-course-filter"><strong>{{ homeworkCourse }}</strong><span>全部作业</span><button class="icon-button" type="button" aria-label="清除课程筛选" title="清除课程筛选" @click="homeworkCourse = ''"><IconGlyph name="close" /></button></div>
-          <div class="toolbar"><div class="segmented task-filters"><button v-for="filter in [{id:'todo',label:`待完成 ${todoTasks.length}`},{id:'all',label:`全部 ${accountTasks.length}`},{id:'done',label:`已完成 ${accountTasks.filter(t=>t.status==='done').length}`},{id:'submitted',label:`已提交 ${accountTasks.filter(t=>t.status==='submitted').length}`} ]" :key="filter.id" type="button" :class="{ active: taskFilter === filter.id }" @click="taskFilter = filter.id as typeof taskFilter">{{ filter.label }}</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="taskSearch" placeholder="搜索任务或课程" /></label></div>
+          <div class="toolbar"><div class="segmented task-filters"><button v-for="filter in [{id:'todo',label:`待完成 ${kindTasks.filter(t=>t.status==='todo').length}`},{id:'all',label:`全部 ${kindTasks.length}`},{id:'done',label:`已完成 ${kindTasks.filter(t=>t.status==='done').length}`},{id:'submitted',label:`已提交 ${kindTasks.filter(t=>t.status==='submitted').length}`} ]" :key="filter.id" type="button" :class="{ active: taskFilter === filter.id }" @click="taskFilter = filter.id as typeof taskFilter">{{ filter.label }}</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="taskSearch" placeholder="搜索任务或课程" /></label></div>
           <div class="task-list surface">
             <article v-for="task in filteredTasks" :key="task.id" class="task-row" :class="{ completed: task.status !== 'todo', 'homework-row': task.homework }">
               <button class="task-check" :class="{ checked: task.status !== 'todo' }" type="button" :disabled="Boolean(task.homework)" :aria-label="task.homework ? '作业状态由教学云同步' : task.status === 'done' ? '恢复任务' : '完成任务'" @click="toggleTask(task)"><IconGlyph :name="task.homework && task.status === 'todo' ? 'book' : 'check'" :size="14" /></button>
               <div class="task-body"><button v-if="task.homework" class="homework-title" type="button" @click="selectedHomeworkId = task.id">{{ task.title }}</button><strong v-else>{{ task.title }}</strong><span><b>{{ task.course }}</b><span class="dot-separator">·</span><IconGlyph name="bell" :size="13" /> {{ formatReminder(task.reminderMinutes) }}<template v-if="task.remindDuringQuiet"><span class="dot-separator">·</span>静默时段仍提醒</template></span></div>
-              <div class="task-due"><span :class="{ overdue: new Date(task.dueAt).getTime() < Date.now() && task.status === 'todo' }">{{ formatDateTime(task.dueAt) }}</span><small>{{ task.status === 'submitted' ? '已提交' : task.status === 'done' ? '已完成' : relativeDue(task.dueAt) }}</small></div>
+              <div class="task-due"><span v-if="isAndroidRuntime && task.kind === 'schedule'">开始 {{ formatDateTime(task.startAt || '') }}</span><span :class="{ overdue: new Date(task.dueAt).getTime() < Date.now() && task.status === 'todo' }">{{ isAndroidRuntime ? task.kind === 'schedule' ? '结束 ' : '截止 ' : '' }}{{ formatDateTime(task.dueAt) }}</span><small>{{ task.status === 'submitted' ? '已提交' : task.status === 'done' ? '已完成' : relativeDue(task.dueAt) }}</small></div>
               <button v-if="task.status === 'todo' && !task.homework" class="row-action" type="button" aria-label="编辑任务" @click="openTaskEdit(task)"><IconGlyph name="edit" /></button><button v-if="task.homework" class="row-action" type="button" aria-label="查看作业详情" title="查看作业详情" @click="selectedHomeworkId = task.id"><IconGlyph name="book" /></button><button v-if="canDeleteTask(task)" class="row-action danger" :class="{ confirming: deleteConfirmId === task.id }" type="button" :aria-label="deleteConfirmId === task.id ? '确认删除任务' : '删除任务'" @click="deleteTask(task)"><span v-if="deleteConfirmId === task.id">{{ TEXTS.tasks.confirmDelete }}</span><IconGlyph v-else name="trash" /></button>
             </article>
             <div v-if="!filteredTasks.length" class="empty-state"><IconGlyph name="search" :size="28" /><strong>没有找到任务</strong><span>换个关键词，或新建一项任务</span></div>
           </div>
+          <section v-if="isAndroidRuntime && taskKindFilter === 'schedule' && ['todo','all'].includes(taskFilter)" class="android-course-schedules">
+            <h2>未来七天课程</h2>
+            <button v-for="entry in upcomingCourseSchedules" :key="`${entry.course.id}:${entry.start}`" type="button" class="android-course-schedule" @click="selectedCourse = entry.course">
+              <IconGlyph name="book" /><span><strong>{{ entry.course.name }}</strong><small>{{ formatDateTime(new Date(entry.start).toISOString()) }} 至 {{ formatDateTime(new Date(entry.end).toISOString()) }}</small><small>{{ entry.course.location }}</small></span>
+            </button>
+            <p v-if="!upcomingCourseSchedules.length">未来七天暂无课程</p>
+          </section>
         </section>
 
         <section v-else-if="currentPage === 'courses'" class="page courses-page">
           <header class="page-heading course-heading"><div class="week-switcher"><button class="icon-button" type="button" aria-label="上一周" :disabled="selectedWeek <= 1" @click="changeWeek(-1)"><IconGlyph name="chevron-left" /></button><h1>第 <input class="week-number-input" type="text" inputmode="numeric" pattern="[0-9]*" :value="selectedWeek" aria-label="查看第几周课程" @blur="updateSelectedWeek" @keydown.enter.prevent="finishSelectedWeekInput" /> 周课程</h1><button class="icon-button" type="button" aria-label="下一周" :disabled="selectedWeek >= MAX_ACADEMIC_WEEK" @click="changeWeek(1)"><IconGlyph name="chevron-right" /></button></div><div class="course-heading-actions"><button class="icon-button" type="button" aria-label="添加课程" title="添加课程" @click="openCourseAdd()"><IconGlyph name="plus" /></button><button class="primary-button course-import-button" type="button" aria-label="导入课表" title="导入课表" @click="openImport"><IconGlyph name="upload" /></button></div></header>
           <div class="schedule-wrap surface">
-            <div class="schedule-grid" :style="{ '--schedule-days': compactSchedule.days, '--schedule-rows': compactSchedule.rows }">
+            <div :key="isAndroidRuntime ? selectedWeek : 0" class="schedule-grid" :style="{ '--schedule-days': compactSchedule.days, '--schedule-rows': compactSchedule.rows }">
               <div class="schedule-corner" :style="{ gridColumn: '1', gridRow: '1' }" /><div v-for="(day, dayIndex) in weekDates" :key="day.label" class="day-header" :class="{ 'mobile-hidden': dayIndex >= compactSchedule.days }" :style="{ gridColumn: String(dayIndex + 2), gridRow: '1' }"><strong>{{ day.label }}</strong><span>{{ formatWeekDate(day.date) }}</span></div>
               <template v-for="row in sectionRows" :key="row.key">
                 <div class="section-label" :class="{ 'mobile-hidden': row.key > compactSchedule.lastSection, 'empty-section': !compactSchedule.occupied[row.key - 1] }" :style="{ gridColumn: '1', gridRow: String(row.key + 1) }"><strong>{{ row.label }}</strong><span>{{ row.startTime }}</span><span>{{ row.endTime }}</span></div>
                 <button v-for="day in 7" :key="`${row.key}-${day}`" class="schedule-slot" :class="{ 'mobile-hidden': day > compactSchedule.days || row.key > compactSchedule.lastSection, selected: pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key }" :style="{ gridColumn: String(day + 1), gridRow: String(row.key + 1) }" type="button" :aria-label="`${weekdays[day - 1]}第${row.key}节空白课程区域`" @click="handleScheduleSlotClick(day, row.key)"><IconGlyph v-if="pendingCourseSlot?.weekday === day && pendingCourseSlot.startSection === row.key" name="plus" :size="18" /></button>
               </template>
-              <button v-for="course in visibleCourses" :key="course.id" class="course-cell" :class="[`course-${course.color}`, { compact: course.endSection === course.startSection }]" :style="courseGridPosition(course)" type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><span>{{ course.location }}</span><small>{{ course.teacher }}</small></button>
+              <button v-for="course in visibleCourses" :key="course.id" class="course-cell" :class="[`course-${course.color}`, { compact: course.endSection === course.startSection }]" :style="courseGridPosition(course)" type="button" @click="openCourseDetails(course)"><strong>{{ course.name }}</strong><span>{{ course.location }}</span><small>{{ course.teacher }}</small><em v-if="isAndroidRuntime && courseHasHomework(course)" class="course-homework-badge">有作业待完成</em></button>
             </div>
           </div>
           <div v-if="!visibleCourses.length" class="empty-state compact"><strong>这一周没有课程</strong><span>仍可使用上方按钮继续切换周次，或导入你的真实课表</span></div>
@@ -2757,7 +2940,7 @@ function runAssistantAction(message: AssistantMessage): void {
           <nav class="campus-service-links" aria-label="北邮校园系统快捷入口"><a v-for="service in campusServices" :key="service.name" :href="service.url" target="_blank" rel="noopener noreferrer"><span><strong>{{ service.name }}</strong><small>{{ service.description }}</small></span><IconGlyph name="external" :size="17" /></a></nav>
           <div v-if="campusStatuses.length" class="campus-statuses" aria-label="校园数据来源状态"><span v-for="status in campusStatuses" :key="status.source" :class="`mode-${status.mode}`"><i /> <strong>{{ status.label }}</strong>{{ status.message }}</span></div>
           <div class="toolbar"><div class="segmented"><button type="button" :class="{ active: campusTab === 'notice' }" @click="campusTab = 'notice'">信息门户</button><button type="button" :class="{ active: campusTab === 'activity' }" @click="campusTab = 'activity'">第二课堂</button></div><label class="search-field"><IconGlyph name="search" /><input v-model="campusSearch" placeholder="搜索标题、类别或内容" /></label></div>
-          <p v-if="campusError" class="service-warning" role="status"><span>{{ campusError }}<template v-if="campusItems.length">已保留成功读取的数据</template></span><button v-if="campusNeedsRelogin" class="secondary-button" type="button" :disabled="campusBusy" @click="reloginCampus">重新登录（可能会短暂打开浏览器）</button></p>
+          <p v-if="campusError" class="service-warning" role="status"><span>{{ campusError }}<template v-if="campusItems.length">已保留成功读取的数据</template></span><button v-if="campusNeedsRelogin" class="secondary-button" type="button" :disabled="campusBusy" @click="reloginCampus">重新登录</button></p>
           <div class="campus-grid">
             <article v-for="item in filteredCampusItems" :key="`${item.kind}:${item.id}`" class="campus-card surface" :class="{ unread: !item.read }">
               <div class="campus-card-top"><span class="category-chip">{{ item.source }}</span><a v-if="item.kind === 'notice'" class="campus-original" :href="item.url" target="_blank" rel="noopener noreferrer" @click="item.read = true"><IconGlyph name="external" :size="14" />查看原文</a></div>
@@ -2769,7 +2952,11 @@ function runAssistantAction(message: AssistantMessage): void {
                 </template>
                 <template v-else><div v-if="item.detailHtml" class="activity-detail" v-html="DOMPurify.sanitize(item.detailHtml, { ADD_ATTR: ['target'] })" /><p v-else>{{ item.summary || (item.detailError ? '' : '暂无活动详情') }}</p><p v-if="item.detailError" class="form-error" role="status">{{ item.detailError }}</p></template>
                 <span v-if="item.campus"><IconGlyph name="map" :size="14" />{{ item.campus }}</span><span v-if="item.eventTime"><IconGlyph name="clock" :size="14" />{{ formatCampusDate(item.eventTime, true) }}<template v-if="item.eventEndTime"> - {{ formatCampusDate(item.eventEndTime, true) }}</template></span></div>
-              <footer><template v-if="item.kind === 'activity'"><span class="activity-statuses"><b v-for="status in (item.activityStatus ?? ['状态未读取'])" :key="status" :class="{ full: status === '人数已满' }">{{ status }}</b></span><time v-if="item.activityStatus?.includes('需报名')" class="activity-registration">报名：{{ item.registrationStartTime ? formatCampusDate(item.registrationStartTime, true) : '开始时间未提供' }} 至 {{ item.registrationEndTime ? formatCampusDate(item.registrationEndTime, true) : '结束时间未提供' }}</time></template><template v-else><span>{{ item.source }}</span><time>{{ formatCampusDate(item.publishedAt) }}</time></template></footer>
+              <footer><template v-if="item.kind === 'activity'"><span class="activity-statuses"><b v-for="status in (item.activityStatus ?? ['状态未读取'])" :key="status" :class="{ full: status === '人数已满' }">{{ status }}</b><b v-if="isAndroidRuntime && activityConflicts[item.id]" :class="`time-conflict-${activityConflicts[item.id]}`" :title="activityConflicts[item.id] === 'direct' ? '与课程或日程直接重叠' : '双方前后各预留十分钟后重叠'">时间冲突 · {{ activityConflicts[item.id] === 'direct' ? '重叠' : '间隔不足' }}</b></span><time v-if="item.activityStatus?.includes('需报名')" class="activity-registration">报名：{{ item.registrationStartTime ? formatCampusDate(item.registrationStartTime, true) : '开始时间未提供' }} 至 {{ item.registrationEndTime ? formatCampusDate(item.registrationEndTime, true) : '结束时间未提供' }}</time></template><template v-else><span>{{ item.source }}</span><time>{{ formatCampusDate(item.publishedAt) }}</time></template></footer>
+              <div v-if="isAndroidRuntime && item.kind === 'activity'" class="android-activity-actions">
+                <button type="button" class="secondary-button" :aria-pressed="registrationReminders.some(reminder => reminder.activityId === item.id)" @click="toggleRegistrationReminder(item)"><IconGlyph name="bell" />{{ registrationReminders.some(reminder => reminder.activityId === item.id) ? '取消报名提醒' : '提醒报名' }}</button>
+                <button type="button" class="secondary-button" :disabled="activityScheduled(item)" @click="addActivitySchedule(item)"><IconGlyph :name="activityScheduled(item) ? 'check' : 'plus'" />{{ activityScheduled(item) ? '已加入日程' : '加入日程' }}</button>
+              </div>
             </article>
           </div>
           <div v-if="campusBusy && !campusItems.length" class="empty-state surface"><IconGlyph name="refresh" :size="28" /><strong>正在读取官方服务</strong><span>信息门户与第二课堂会分别返回状态</span></div>
@@ -2786,7 +2973,22 @@ function runAssistantAction(message: AssistantMessage): void {
           <article v-else class="surface electricity-result-card" :class="{ low: electricityResult && electricityResult.balance < 10 }">
             <div class="surface-heading"><div><span class="eyebrow">已绑定宿舍</span><h2>{{ electricityDormitory }}</h2></div><button class="danger-button" type="button" @click="unbindElectricity">解除绑定</button></div>
             <div v-if="electricityResult" class="balance-display"><small>{{ electricityResult.unit === '元' ? '当前余额' : '剩余总电量（含赠送电量）' }}</small><strong>{{ electricityResult.balance.toFixed(2) }}<b> {{ electricityResult.unit }}</b></strong><span v-if="electricityResult.balance < 10">{{ electricityResult.unit === '元' ? '余额' : '剩余总电量' }}不足 10 {{ electricityResult.unit }}，请及时充值</span><span v-else>{{ electricityResult.unit === '元' ? '余额' : '剩余总电量' }}充足</span><div class="balance-times"><time>电费更新于 {{ formatDateTime(electricityResult.updatedAt) }}</time><time>本次查询于 {{ formatDateTime(electricityResult.queriedAt) }}</time></div></div>
-            <div v-else-if="electricityBusy" class="electricity-loading"><IconGlyph name="refresh" :size="26" /><strong>正在查询电费余额</strong></div>
+            <div v-if="!electricityResult && electricityBusy" class="electricity-loading"><IconGlyph name="refresh" :size="26" /><strong>正在查询电费余额</strong></div>
+            <section v-if="isAndroidRuntime" class="electricity-chart" aria-label="最近七天每日使用电费">
+              <h3>最近七天{{ electricityChart.unit === '元' ? '电费' : '用电量' }}</h3>
+              <small>余额差估算（{{ electricityChart.unit }}），非官方日账单；缺测、充值日不计</small>
+              <svg viewBox="0 0 640 198" role="img" aria-label="最近七天每日使用折线图">
+                <polyline class="electricity-chart-axis" points="40,30 40,166 608,166" />
+                <polyline v-for="(segment, index) in electricityChart.segments" :key="index" class="electricity-chart-line" :points="segment" fill="none" />
+                <template v-for="point in electricityChart.points" :key="point.date">
+                  <circle v-if="point.usage !== null" class="electricity-chart-point" :cx="point.x" :cy="166 - (point.usage / electricityChart.max) * 130" r="4"><title>{{ point.date }}：{{ point.usage.toFixed(2) }} {{ electricityChart.unit }}</title></circle>
+                  <text v-if="point.usage !== null" :x="point.x" :y="154 - (point.usage / electricityChart.max) * 130">{{ point.usage.toFixed(2) }}</text>
+                  <text :x="point.x" y="190">{{ point.date.slice(5) }}</text>
+                </template>
+              </svg>
+              <p v-if="!electricityChart.hasData" class="chart-empty">暂无连续两日记录</p>
+              <ul class="electricity-daily-values"><li v-for="point in electricityChart.points" :key="point.date"><time>{{ point.date.slice(5) }}</time><span>{{ point.usage === null ? point.reason : `${point.usage.toFixed(2)} ${electricityChart.unit}` }}</span></li></ul>
+            </section>
             <p v-if="electricityError" class="service-warning" role="alert">{{ electricityError }}</p>
             <footer><button class="secondary-button" type="button" :disabled="electricityBusy" @click="queryElectricity()"><IconGlyph name="refresh" />{{ electricityBusy ? '正在查询' : '重新查询' }}</button><a class="primary-button" href="https://app.bupt.edu.cn/buptdf/wap/default/chong" target="_blank" rel="noopener noreferrer"><IconGlyph name="external" />前往官方页面</a></footer>
           </article>
@@ -2825,7 +3027,14 @@ function runAssistantAction(message: AssistantMessage): void {
           <header class="page-heading"><span class="eyebrow">个人偏好</span><h1>设置</h1><p>{{ TEXTS.pages.settingsDescription }}</p></header>
           <article class="settings-section surface profile-settings"><div><h2>个人资料</h2><p>昵称会用于问候；头像可从本地上传，图片只保存在当前设备</p></div><div class="profile-editor"><span class="avatar avatar-preview"><img v-if="profileDraftAvatar" :src="profileDraftAvatar" alt="头像预览" /><template v-else>{{ profileDraftName.trim().slice(0, 1) || '邮' }}</template></span><div class="profile-fields"><label>昵称<input v-model="profileDraftName" maxlength="20" placeholder="该怎么称呼你" @input="profileEditError = ''" /></label><div class="avatar-upload-actions"><label class="secondary-button file-button"><IconGlyph name="upload" :size="16" />上传头像<input type="file" accept="image/png,image/jpeg,image/webp" @change="selectAvatarFile" /></label><button v-if="profileDraftAvatar" class="text-button" type="button" @click="clearAvatarDraft">移除头像</button><small>PNG、JPG 或 WebP，不超过 2 MB</small></div><p v-if="profileEditError" class="inline-error" role="alert">{{ profileEditError }}</p></div><button class="secondary-button" type="button" @click="saveProfile">保存资料</button></div></article>
           <article class="settings-section surface appearance-settings"><div><h2>外观与动效</h2><p>选择显示模式，并按需要降低界面动态效果</p></div><div class="appearance-controls"><div class="segmented"><button v-for="option in [{id:'system',label:'跟随系统'},{id:'light',label:'浅色'},{id:'dark',label:'深色'}]" :key="option.id" type="button" :class="{ active: preferences.theme === option.id }" @click="preferences.theme = option.id as Preferences['theme']">{{ option.label }}</button></div><label class="switch-row motion-setting"><span><strong>减少动画效果</strong><small>关闭菜单滑动和页面淡入淡出，适合对动态效果敏感时使用</small></span><input v-model="preferences.reduceMotion" type="checkbox" role="switch" aria-label="减少动画效果" /></label></div></article>
-          <article class="settings-section surface"><div><h2>默认提醒</h2><p>{{ TEXTS.pages.reminderDescription }}</p></div><label>任务提前<div class="reminder-control"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="defaultTaskReminderValue" @input="updateDefaultTaskReminderInput" @blur="restoreDefaultTaskReminderInput" /><select :value="defaultTaskReminderUnit" aria-label="任务提醒单位" @change="changeDefaultTaskReminderUnit"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="courseReminderValue" @input="updateCourseReminderInput" @blur="restoreCourseReminderInput" /><span>分钟</span></div></label></article>
+          <article class="settings-section surface"><div><h2>默认提醒</h2><p>{{ TEXTS.pages.reminderDescription }}</p></div><label>任务提前<div class="reminder-control"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="defaultTaskReminderValue" @input="updateDefaultTaskReminderInput" @blur="restoreDefaultTaskReminderInput" /><select :value="defaultTaskReminderUnit" aria-label="任务提醒单位" @change="changeDefaultTaskReminderUnit"><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label><label>课程提前<div class="number-with-unit"><input type="text" inputmode="numeric" pattern="[0-9]*" :value="courseReminderValue" @input="updateCourseReminderInput" @blur="restoreCourseReminderInput" /><span>分钟</span></div></label><label v-if="isAndroidRuntime">报名前提醒<div class="number-with-unit"><input type="number" min="0" max="10080" step="1" :value="preferences.registrationReminder ?? 5" @change="updateRegistrationReminder" /><span>分钟</span></div></label></article>
+          <section v-if="isAndroidRuntime && registrationReminders.length" class="settings-section registration-subscriptions">
+            <h2>报名提醒</h2>
+            <div v-for="reminder in registrationReminders" :key="reminder.activityId" class="registration-subscription">
+              <span><strong>{{ reminder.title }}</strong><small>报名开始 {{ formatCampusDate(reminder.registrationStartTime, true) }}</small></span>
+              <button class="icon-button" type="button" :aria-label="`取消报名提醒：${reminder.title}`" title="取消报名提醒" @click="registrationReminders = registrationReminders.filter(item => item.activityId !== reminder.activityId)"><IconGlyph name="close" /></button>
+            </div>
+          </section>
           <article class="settings-section surface notification-settings"><div><h2>通知设置</h2><p>声音和系统通知可以分别控制</p></div><div class="notification-controls"><label class="switch-row"><span><strong>播放声音</strong><small>提醒触发时播放提示音</small></span><input v-model="preferences.soundNotifications" type="checkbox" role="switch" aria-label="播放声音" /></label><label class="switch-row"><span><strong>系统通知</strong><small>需允许系统通知与后台运行权限</small></span><input v-model="preferences.browserNotifications" type="checkbox" role="switch" aria-label="系统通知" @change="handleBrowserNotificationsChange" /></label><button v-if="isAndroidRuntime" class="secondary-button" type="button" @click="requestNativeReminderPermissions"><IconGlyph name="bell" />检查提醒权限</button></div></article>
           <article class="settings-section surface"><div><h2>学期课表</h2><p>第 1 周起始日，用于计算周次；周课表仍按周一至周日排列</p></div><label>第一周开始<input v-model="preferences.semesterStart" type="date" /></label></article>
           <article class="settings-section surface"><div><h2>静默时段</h2><p>{{ TEXTS.pages.quietHoursDescription }}</p></div><label>开始<input v-model="preferences.quietStart" type="time" /></label><label>结束<input v-model="preferences.quietEnd" type="time" /></label></article>
@@ -2849,7 +3058,9 @@ function runAssistantAction(message: AssistantMessage): void {
       </section>
     </div>
     <div v-if="taskModalOpen" class="modal-backdrop" @click.self="taskModalOpen = false">
-      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header><div><span class="eyebrow">{{ editingTaskId === null ? '新建' : '编辑' }}</span><h2 id="task-modal-title">{{ editingTaskId === null ? '添加任务' : '编辑任务' }}</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="taskModalOpen = false"><IconGlyph name="close" /></button></header><form @submit.prevent="createTask"><label>任务内容<input v-model="taskForm.title" autofocus placeholder="例如：完成软件工程需求分析" /></label><div class="form-grid"><label>课程或分类<input v-model="taskForm.course" placeholder="个人计划" /></label><label>截止时间<input v-model="taskForm.dueAt" type="datetime-local" /></label></div><label>提前提醒（分钟）<input v-model.number="taskForm.reminderMinutes" type="number" min="0" max="10080" step="1" placeholder="0 表示到点提醒" /></label><label class="switch-row modal-switch"><span><strong>静默时段仍提醒</strong><small>仅为确实不能错过的任务开启</small></span><input v-model="taskForm.remindDuringQuiet" type="checkbox" role="switch" /></label><footer><button class="secondary-button" type="button" @click="taskModalOpen = false">取消</button><button class="primary-button" type="submit">{{ editingTaskId === null ? '添加任务' : '保存修改' }}</button></footer></form></section>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header><div><span class="eyebrow">{{ editingTaskId === null ? '新建' : '编辑' }}</span><h2 id="task-modal-title">{{ editingTaskId === null ? '添加任务' : '编辑任务' }}</h2></div><button class="icon-button" type="button" aria-label="关闭" @click="taskModalOpen = false"><IconGlyph name="close" /></button></header><form @submit.prevent="createTask">
+        <div v-if="isAndroidRuntime" class="segmented" aria-label="新任务类型"><button type="button" :class="{ active: taskForm.kind === 'todo' }" @click="taskForm.kind = 'todo'">待办</button><button type="button" :class="{ active: taskForm.kind === 'schedule' }" @click="taskForm.kind = 'schedule'">日程</button></div>
+        <label>任务内容<input v-model="taskForm.title" autofocus placeholder="例如：完成软件工程需求分析" /></label><div class="form-grid"><label>课程或分类<input v-model="taskForm.course" placeholder="个人计划" /></label><label v-if="isAndroidRuntime && taskForm.kind === 'schedule'">开始时间<input v-model="taskForm.startAt" type="datetime-local" required /></label><label>{{ isAndroidRuntime && taskForm.kind === 'schedule' ? '结束时间' : '截止时间' }}<input v-model="taskForm.dueAt" type="datetime-local" /></label></div><label>{{ isAndroidRuntime ? taskForm.kind === 'schedule' ? '开始前提醒（分钟）' : '截止前提醒（分钟）' : '提前提醒（分钟）' }}<input v-model.number="taskForm.reminderMinutes" type="number" min="0" max="10080" step="1" placeholder="0 表示到点提醒" /></label><label class="switch-row modal-switch"><span><strong>静默时段仍提醒</strong><small>仅为确实不能错过的任务开启</small></span><input v-model="taskForm.remindDuringQuiet" type="checkbox" role="switch" /></label><footer><button class="secondary-button" type="button" @click="taskModalOpen = false">取消</button><button class="primary-button" type="submit">{{ editingTaskId === null ? '添加任务' : '保存修改' }}</button></footer></form></section>
     </div>
 
     <div v-if="courseAddOpen" class="modal-backdrop" @click.self="courseAddOpen = false">

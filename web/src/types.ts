@@ -12,6 +12,15 @@ export interface StudyTask {
   status: TaskStatus;
   createdAt: string;
   homework?: HomeworkItem & { accountKey: string };
+  kind?: "todo" | "schedule";
+  startAt?: string;
+  activityId?: string;
+}
+
+export interface RegistrationReminder {
+  activityId: string;
+  title: string;
+  registrationStartTime: string;
 }
 
 export interface HomeworkItem {
@@ -76,6 +85,14 @@ export interface ElectricityResult {
   sourceUrl: string;
 }
 
+export interface ElectricitySnapshot {
+  dormitory?: string;
+  accountKey?: string;
+  date: string;
+  balance: number;
+  unit: "元" | "度";
+}
+
 export interface AppNotification {
   id: number;
   title: string;
@@ -137,6 +154,7 @@ export interface Preferences {
   reduceMotion: boolean;
   courseReminder: number;
   defaultTaskReminder: number;
+  registrationReminder?: number;
   semesterStart: string;
   quietStart: string;
   quietEnd: string;

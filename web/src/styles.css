@@ -289,6 +289,19 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .homework-title:hover { color: var(--blue-strong); }
 .homework-row .task-body > span { flex-wrap: wrap; }
 .homework-row { padding-block: 12px; }
+.android-task-kinds { margin-bottom: 16px; }
+.android-activity-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.activity-statuses b.time-conflict-direct { background: #ffe4e6; color: #9f1239; border-color: #be123c; }
+.activity-statuses b.time-conflict-buffer { background: #fef08a; color: #713f12; border-color: #a16207; }
+.android-course-schedules { margin-top: 24px; }
+.android-course-schedules h2 { font-size: 16px; }
+.android-course-schedule { display: flex; gap: 12px; width: 100%; padding: 12px 0; color: var(--text); background: none; border: 0; border-bottom: 1px solid var(--border); text-align: left; cursor: pointer; }
+.android-course-schedule > span { display: grid; min-width: 0; gap: 6px; overflow-wrap: anywhere; }
+.android-course-schedule small { color: var(--text-secondary); }
+.registration-subscription { display: flex; justify-content: space-between; gap: 12px; padding-block: 10px; border-bottom: 1px solid var(--border); }
+.registration-subscription > span { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.registration-subscription small { color: var(--text-secondary); }
+.registration-subscription .icon-button { flex-shrink: 0; }
 .homework-detail { width: min(720px, 100%); border-radius: 8px; }
 .homework-detail > header > div { min-width: 0; }
 .homework-detail h2 { font-size: 18px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -323,8 +336,12 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .week-number-input:focus { border-color: var(--blue); outline: 3px solid color-mix(in srgb, var(--blue) 20%, transparent); outline-offset: 1px; }
 .sync-status { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 11px; }
 .sync-status .status-dot { margin-top: 0; }
-.schedule-wrap { overflow-x: auto; padding: 15px; }
+.schedule-wrap { max-height: calc(100vh - 190px); overflow: auto; padding: 15px; }
 .schedule-grid { display: grid; grid-template-columns: 72px repeat(7, minmax(105px, 1fr)); grid-template-rows: 42px repeat(14, 68px); gap: 6px; min-width: 900px; }
+html[data-platform="android"] .schedule-grid { grid-template-rows: var(--schedule-rows); }
+html[data-platform="android"] .course-homework-badge { flex: 0 0 auto; margin-top: auto; padding: 3px 1px; }
+.electricity-daily-values { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 8px; padding: 0; list-style: none; font-size: 11px; }
+.electricity-daily-values li { display: flex; flex-direction: column; gap: 4px; }
 .schedule-corner, .day-header { min-height: 0; }
 .day-header { display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 11px; }
 .day-header strong { color: var(--text); font-size: 11px; }
@@ -337,11 +354,12 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .schedule-slot.selected { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--blue) 28%, transparent); }
 .course-cell { position: relative; z-index: 2; min-width: 0; min-height: 0; overflow: hidden; padding: 10px; border: 0; border-left: 3px solid currentColor; border-radius: 9px; text-align: left; cursor: pointer; transition: transform .15s ease, filter .15s ease; }
 .course-cell:hover { transform: translateY(-2px); filter: saturate(1.12); }
-.course-cell strong, .course-cell span, .course-cell small { display: block; }
+.course-cell strong, .course-cell span, .course-cell small, .course-cell em { display: block; }
 .course-cell strong { display: -webkit-box; overflow: hidden; color: var(--text); font-size: 11px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .course-cell span, .course-cell small { margin-top: 5px; color: var(--text-secondary); font-size: 9px; }
 .course-cell.compact { padding-block: 7px; }
 .course-cell.compact span, .course-cell.compact small { display: none; }
+.course-homework-badge { margin-top: 7px; padding: 3px 5px; border-radius: 4px; color: #9a3412 !important; background: #ffedd5; font-size: 8px !important; font-style: normal; font-weight: 700; line-height: 1.3; }
 .course-blue { color: var(--blue); background: var(--blue-soft); }
 .course-violet { color: var(--violet); background: var(--violet-soft); }
 .course-green { color: var(--green); background: var(--green-soft); }
@@ -609,6 +627,15 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .balance-display time { color: var(--text-tertiary); font-size: 9px; }
 .electricity-loading { display: grid; place-items: center; gap: 10px; min-height: 190px; color: var(--text-secondary); font-size: 11px; }
 .electricity-loading .icon-glyph, .summary-loading .icon-glyph { animation: spin 1.1s linear infinite; }
+.electricity-chart { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+.electricity-chart h3 { margin: 0; font-size: 14px; }
+.electricity-chart small, .chart-empty { color: var(--text-secondary); font-size: 10px; }
+.electricity-chart svg { display: block; width: 100%; height: auto; margin-top: 8px; overflow: visible; }
+.electricity-chart-axis { fill: none; stroke: var(--border-strong); stroke-width: 1; }
+.electricity-chart-line { stroke: var(--orange); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.electricity-chart-point { fill: var(--surface); stroke: var(--orange); stroke-width: 3; }
+.electricity-chart text { fill: var(--text-secondary); font-size: 18px; text-anchor: middle; }
+.chart-empty { margin: 0; }
 .summary-loading { display: flex; align-items: center; gap: 9px; min-height: 70px; color: var(--text-secondary); font-size: 11px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -806,6 +833,15 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .task-filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; }
   .task-filters button { padding-inline: 4px; font-size: 11px; white-space: normal; }
   .homework-row .task-due { margin-top: 0; }
+  [data-platform="android"] .task-row { padding-block: 12px; align-items: start; }
+  [data-platform="android"] .task-check { grid-column: 1; grid-row: 1; }
+  [data-platform="android"] .task-body { grid-column: 2 / -1; grid-row: 1; }
+  [data-platform="android"] .task-body > strong { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
+  [data-platform="android"] .task-body > span { flex-wrap: wrap; }
+  [data-platform="android"] .task-due { grid-column: 2; grid-row: 2; margin-top: 0; line-height: 1.6; }
+  [data-platform="android"] .task-due small { display: block; margin-left: 0; }
+  [data-platform="android"] .task-row .row-action { grid-column: 3; grid-row: 2; }
+  [data-platform="android"] .task-row .row-action.danger { grid-column: 4; }
   .row-action { grid-column: 3; grid-row: 1 / span 2; opacity: 1; }
   .row-action.danger { grid-column: 4; }
   .row-action.confirming { position: absolute; right: 0; top: 50%; transform: translateY(-50%); }
@@ -816,11 +852,14 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .courses-page > .page-heading p { display: none; }
   .courses-page .course-toolbar { flex: 0 0 auto; flex-direction: row; align-items: center; margin-bottom: 8px; gap: 6px; }
   .courses-page .schedule-wrap { flex: 1; min-height: 0; }
+  [data-platform="android"] .courses-page { padding-bottom: calc(60px + env(safe-area-inset-bottom)); }
+  [data-platform="android"] .courses-page .schedule-wrap { flex: 0 1 auto; max-height: none; }
   .courses-page .empty-state.compact { flex: 0 0 auto; min-height: 28px; padding: 4px 0; }
   .courses-page .empty-state.compact strong { margin: 0; font-size: 11px; }
   .courses-page .empty-state.compact span { display: none; }
   .schedule-wrap { display: block; padding: 6px 3px; border-radius: 8px; }
   .schedule-grid { height: 100%; min-width: 0; grid-template-columns: 30px repeat(var(--schedule-days, 7), minmax(0, 1fr)); grid-template-rows: var(--schedule-rows); gap: 2px; }
+  [data-platform="android"] .schedule-grid { height: auto; align-content: start; }
   .schedule-grid .mobile-hidden { display: none; }
   .section-label { overflow: hidden; }
   .section-label.empty-section span { display: none; }
